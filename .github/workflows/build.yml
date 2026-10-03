@@ -1,0 +1,22 @@
+name: Build 14CFW
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install portlibs
+        run: |
+          dkp-pacman -Sy --noconfirm
+          dkp-pacman -S --noconfirm switch-sdl2 switch-sdl2_ttf switch-curl switch-mbedtls switch-freetype switch-zlib switch-bzip2 switch-libpng
+      - name: Bundle CA certificates
+        run: |
+          mkdir -p romfs
+          curl -fsSL -o romfs/cacert.pem https://curl.se/ca/cacert.pem
+      - name: Build
+        run: make -j$(nproc)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 14CFW
+          path: 14CFW.nro
