@@ -13,9 +13,18 @@
 #include "installer.hpp"
 
 static const int W = 1280, H = 720;
-static const SDL_Color C_BG{11, 14, 23, 255}, C_CARD{18, 22, 36, 255}, C_CARD2{26, 32, 52, 255}, C_BORDER{42, 48, 80, 255},
-    C_TEXT{232, 234, 240, 255}, C_DIM{140, 148, 170, 255}, C_CYAN{25, 230, 255, 255}, C_ORG{255, 122, 69, 255},
-    C_OK{47, 191, 143, 255}, C_ERR{232, 110, 110, 255}, C_WHITE{255, 255, 255, 255}, C_WARN{255, 196, 70, 255};
+// Windows 10 OOBE Orange/Black theme
+static const SDL_Color C_BG{20, 20, 20, 255},          // Dark background
+    C_PANEL{30, 30, 30, 255},                          // Panel background
+    C_BORDER{50, 50, 50, 255},                         // Border color
+    C_TEXT{240, 240, 240, 255},                        // Main text (light gray)
+    C_DIM{140, 140, 140, 255},                         // Dimmed text
+    C_ORG{255, 140, 0, 255},                           // Orange accent
+    C_ORG_DARK{200, 100, 0, 255},                      // Darker orange
+    C_OK{76, 175, 80, 255},                            // Green for success
+    C_ERR{244, 67, 54, 255},                           // Red for error
+    C_WHITE{255, 255, 255, 255},                       // White
+    C_WARN{255, 152, 0, 255};                          // Amber for warning
 
 static const char* SETTINGS_PATH = "sdmc:/switch/14CFW/settings.txt";
 
@@ -28,6 +37,7 @@ static void fillRect(int x, int y, int w, int h, SDL_Color c) {
     SDL_Rect r{x, y, w, h};
     SDL_RenderFillRect(R, &r);
 }
+
 static void rrect(int x, int y, int w, int h, int r, SDL_Color c) {
     if (r * 2 > h) r = h / 2;
     if (r * 2 > w) r = w / 2;
@@ -43,17 +53,42 @@ static void rrect(int x, int y, int w, int h, int r, SDL_Color c) {
     SDL_Rect m{x, y + r, w, h - 2 * r};
     SDL_RenderFillRect(R, &m);
 }
-static void circle(int cx, int cy, int r, SDL_Color c) { rrect(cx - r, cy - r, 2 * r, 2 * r, r, c); }
+
+static void circle(int cx, int cy, int r, SDL_Color c) { 
+    rrect(cx - r, cy - r, 2 * r, 2 * r, r, c); 
+}
+
 static void panel(int x, int y, int w, int h, int r, SDL_Color fill, SDL_Color border) {
     rrect(x, y, w, h, r, border);
     rrect(x + 1, y + 1, w - 2, h - 2, r - 1 > 0 ? r - 1 : 1, fill);
 }
+
 static void line(int x1, int y1, int x2, int y2, SDL_Color c, int t) {
     SDL_SetRenderDrawColor(R, c.r, c.g, c.b, c.a);
     for (int o = -(t / 2); o <= t / 2; o++) {
         SDL_RenderDrawLine(R, x1 + o, y1, x2 + o, y2);
         SDL_RenderDrawLine(R, x1, y1 + o, x2, y2 + o);
     }
+}
+
+// Draw outlined "14" logo with checkmark style
+static void drawLogo14(int cx, int cy, int size) {
+    int thick = size / 8;
+    SDL_Color col = C_ORG;
+    
+    // "1" - vertical line
+    fillRect(cx - size/4, cy - size/3, thick, 2*size/3, col);
+    
+    // "4" - outlined style
+    fillRect(cx + size/8, cy - size/3, thick, size/3, col);  // vertical top
+    fillRect(cx + size/8, cy, thick * 2, thick, col);         // horizontal middle
+    fillRect(cx + size/8 + thick, cy, thick, size/3, col);    // vertical bottom
+    
+    // Checkmark accent on side (small)
+    int ck_x = cx + size/2 + size/8;
+    int ck_y = cy + size/6;
+    line(ck_x - thick, ck_y, ck_x + thick/2, ck_y + thick*2, C_ORG, thick);
+    line(ck_x + thick/2, ck_y + thick*2, ck_x + thick*3, ck_y - thick, C_ORG, thick);
 }
 
 struct CT { SDL_Texture* t; int w, h; };
@@ -80,6 +115,7 @@ static CT getText(TTF_Font* f, const std::string& s, SDL_Color c) {
     tcache[key] = ct;
     return ct;
 }
+
 static int text(TTF_Font* f, const std::string& s, int x, int y, SDL_Color c, int align = 0) {
     if (s.empty() || !f) return 0;
     CT ct = getText(f, s, c);
@@ -89,11 +125,13 @@ static int text(TTF_Font* f, const std::string& s, int x, int y, SDL_Color c, in
     SDL_RenderCopy(R, ct.t, nullptr, &d);
     return ct.w;
 }
+
 static int textW(TTF_Font* f, const std::string& s) {
     int w = 0, h = 0;
     TTF_SizeUTF8(f, s.c_str(), &w, &h);
     return w;
 }
+
 static std::string fit(TTF_Font* f, std::string s, int maxW) {
     if (textW(f, s) <= maxW) return s;
     while (!s.empty()) {
@@ -104,41 +142,43 @@ static std::string fit(TTF_Font* f, std::string s, int maxW) {
     }
     return "...";
 }
+
 static SDL_Color mix(SDL_Color a, SDL_Color b, float t) {
     return SDL_Color{(Uint8)(a.r + (b.r - a.r) * t), (Uint8)(a.g + (b.g - a.g) * t), (Uint8)(a.b + (b.b - a.b) * t), 255};
 }
-static void gradBar(int x, int y, int w, int h) {
-    int seg = 48;
-    for (int i = 0; i < seg; i++) fillRect(x + i * w / seg, y, w / seg + 1, h, mix(C_CYAN, C_ORG, (float)i / (seg - 1)));
-}
+
 static void progressBar(int x, int y, int w, int h, float v) {
-    rrect(x, y, w, h, h / 2, C_CARD2);
+    fillRect(x, y, w, h, C_BORDER);
     if (v < 0) v = 0;
     if (v > 1) v = 1;
     int fw = (int)(w * v);
-    if (fw >= h) {
-        rrect(x, y, fw, h, h / 2, C_CYAN);
-    } else if (fw > 0) {
-        rrect(x, y, h, h, h / 2, C_CYAN);
-    }
+    if (fw > 0) fillRect(x, y, fw, h, C_ORG);
 }
+
 static void checkbox(int x, int y, int s, bool on) {
-    panel(x, y, s, s, 7, on ? C_CYAN : C_CARD, on ? C_CYAN : C_BORDER);
+    fillRect(x, y, s, s, on ? C_BORDER : C_BORDER);
     if (on) {
-        line(x + 6, y + s / 2, x + s / 2 - 1, y + s - 8, C_BG, 3);
-        line(x + s / 2 - 1, y + s - 8, x + s - 6, y + 7, C_BG, 3);
+        line(x + 4, y + s/2, x + s/2 - 2, y + s - 6, C_ORG, 3);
+        line(x + s/2 - 2, y + s - 6, x + s - 4, y + 4, C_ORG, 3);
     }
 }
+
 static void toggle(int x, int y, bool on) {
-    rrect(x, y, 56, 30, 15, on ? C_CYAN : C_BORDER);
-    circle(on ? x + 41 : x + 15, y + 15, 11, C_WHITE);
+    fillRect(x, y, 56, 30, C_BORDER);
+    fillRect(on ? x + 28 : x + 2, y + 2, 26, 26, on ? C_ORG : C_DIM);
 }
 
 struct Rc { int x = 0, y = 0, w = 0, h = 0; };
 static bool hit(const Rc& r, int px, int py) { return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h; }
+
 static void button(const Rc& r, const std::string& label, bool primary) {
-    panel(r.x, r.y, r.w, r.h, r.h / 2, primary ? C_CYAN : C_CARD2, primary ? C_CYAN : C_BORDER);
-    text(fSmall, label, r.x + r.w / 2, r.y + (r.h - 20) / 2, primary ? C_BG : C_TEXT, 1);
+    if (primary) {
+        fillRect(r.x, r.y, r.w, r.h, C_ORG);
+        text(fSmall, label, r.x + r.w / 2, r.y + (r.h - 20) / 2, C_BG, 1);
+    } else {
+        fillRect(r.x, r.y, r.w, r.h, C_BORDER);
+        text(fSmall, label, r.x + r.w / 2, r.y + (r.h - 20) / 2, C_TEXT, 1);
+    }
 }
 
 // ------------------------------------------------------------------ state
@@ -181,6 +221,7 @@ static void saveSettings() {
     fprintf(f, "backup=%d\nkeep=%d\nbootmenu=%d\nreplace=%d\n", opts.backup, opts.keepConfigs, opts.withBootMenu, opts.replaceMenu);
     fclose(f);
 }
+
 static void loadSettings() {
     std::ifstream in(SETTINGS_PATH);
     std::string l;
@@ -258,162 +299,190 @@ static int selectedCount() {
 }
 
 // ------------------------------------------------------------------ screens
-static void header(const std::string& title) {
-    int w1 = text(fBig, "14", 40, 14, C_ORG);
-    text(fBig, "CFW", 40 + w1 + 4, 14, C_CYAN);
-    text(fTitle, title, W - 40, 22, C_TEXT, 2);
-    gradBar(40, 70, W - 80, 3);
-}
-
-static void card(int x, int y, int w, int h, const std::string& title, const std::string& value, const std::string& sub, SDL_Color vc) {
-    panel(x, y, w, h, 16, C_CARD, C_BORDER);
-    text(fSmall, title, x + 20, y + 14, C_DIM);
-    text(fTitle, fit(fTitle, value, w - 40), x + 20, y + 40, vc);
-    text(fSmall, fit(fSmall, sub, w - 40), x + 20, y + h - 30, C_DIM);
-}
-
 static void drawHome() {
     fillRect(0, 0, W, H, C_BG);
-    header("Custom firmware installer");
-    int cx = 40, cy = 96, cw = 366, ch = 118, gap = 16;
+    
+    // Top panel with logo and title
+    fillRect(0, 0, W, 120, C_PANEL);
+    fillRect(0, 115, W, 2, C_ORG);
+    
+    drawLogo14(60, 60, 60);
+    text(fBig, "14 Custom Firmware", 130, 30, C_TEXT);
+    text(fSmall, "Nintendo Switch Installer", 130, 70, C_DIM);
+    
+    // Status cards in grid
+    int cx = 40, cy = 140, cw = 280, ch = 140, gap = 20;
+    
+    auto drawCard = [&](int x, int y, const std::string& title, const std::string& value, SDL_Color vc) {
+        fillRect(x, y, cw, ch, C_PANEL);
+        fillRect(x, y, cw, 2, C_ORG);
+        text(fSmall, title, x + 16, y + 12, C_DIM);
+        text(fBody, fit(fBody, value, cw - 32), x + 16, y + 50, vc);
+    };
+    
     std::string amsV = env.amsRunning ? "v" + env.amsVer : (env.ams ? "Installed" : "Not found");
-    card(cx, cy, cw, ch, "ATMOSPHERE", amsV, env.amsRunning ? "You are running it right now" : (env.ams ? "Files found on the SD card" : "Not installed yet"), env.ams || env.amsRunning ? C_OK : C_WARN);
-    card(cx + cw + gap, cy, cw, ch, "HEKATE", env.hekate ? (env.hekateVer.empty() ? "Installed" : "v" + env.hekateVer) : "Not found", env.hekate ? "Bootloader detected" : "Not installed yet", env.hekate ? C_OK : C_WARN);
+    drawCard(cx, cy, "ATMOSPHERE", amsV, env.ams || env.amsRunning ? C_OK : C_TEXT);
+    
+    std::string hekV = env.hekate ? (env.hekateVer.empty() ? "Installed" : "v" + env.hekateVer) : "Not found";
+    drawCard(cx + cw + gap, cy, "HEKATE", hekV, env.hekate ? C_OK : C_TEXT);
+    
     std::string sd = env.sdOk ? inst::humanSize(env.freeBytes) + " free" : "Unreadable";
-    card(cx, cy + ch + gap, cw, ch, "SD CARD", sd, env.sdOk ? "of " + inst::humanSize(env.totalBytes) : "", env.sdOk ? C_TEXT : C_ERR);
-    std::string bat = env.battery >= 0 ? std::to_string(env.battery) + "%" + (env.charging ? "  charging" : "") : "Unknown";
+    drawCard(cx, cy + ch + gap, "SD CARD", sd, env.sdOk ? C_OK : C_ERR);
+    
+    std::string bat = env.battery >= 0 ? std::to_string(env.battery) + "%" : "Unknown";
     bool lowBat = env.battery >= 0 && env.battery < 30 && !env.charging;
-    card(cx + cw + gap, cy + ch + gap, cw, ch, "BATTERY", bat, lowBat ? "Plug in the charger before installing" : "OK for installing", lowBat ? C_ERR : C_TEXT);
-    card(cx, cy + 2 * (ch + gap), cw, ch, "GAMES AND SAVES", env.nintendo ? "Protected" : "No Nintendo folder", "The Nintendo folder is never modified", C_OK);
-    card(cx + cw + gap, cy + 2 * (ch + gap), cw, ch, "EMUMMC", env.emummc ? "Found, protected" : "Not found", "The emuMMC folder is never modified", env.emummc ? C_OK : C_DIM);
-
-    // detected apps
-    std::string det;
-    int n = 0;
-    for (auto& c : comps)
-        if (c.installed) { det += (det.empty() ? "" : ", ") + c.name; n++; }
-    text(fSmall, "Detected: " + (det.empty() ? std::string("none of the known apps yet") : fit(fSmall, det, 640)), 40, 540 + 20, C_DIM);
-    text(fSmall, std::to_string(n) + " of " + std::to_string(comps.size()) + " known components are already installed", 40, 568 + 20, C_DIM);
-
-    // menu
-    int mx = 800, mw = 440;
-    panel(mx - 20, 96, mw + 40, 560, 20, C_CARD, C_BORDER);
-    static const char* items[5] = {"Install / Update", "Install 14CFW boot menu", "Settings", "Rescan SD card", "Exit"};
-    static const char* subs[5] = {"Pick components, customize the install", "Custom Hekate menu, logo and icon", "Backups, configs, boot menu mode", "Detect what is already installed", "Return to hbmenu"};
+    drawCard(cx + cw + gap, cy + ch + gap, "BATTERY", bat, lowBat ? C_ERR : C_OK);
+    
+    // Right side menu
+    int mx = 800, mh = 500;
+    text(fBody, "Setup Options", mx, 140, C_ORG);
+    
+    static const char* items[5] = {"Install Components", "Boot Menu Only", "Settings", "Refresh Status", "Exit"};
     for (int i = 0; i < 5; i++) {
-        rcHome[i] = {mx, 120 + i * 100, mw, 84};
+        rcHome[i] = {mx, 180 + i * 90, 420, 75};
         bool sel = i == homeSel;
-        panel(rcHome[i].x, rcHome[i].y, rcHome[i].w, rcHome[i].h, 16, sel ? C_CARD2 : C_CARD, sel ? C_CYAN : C_BORDER);
-        circle(mx + 36, rcHome[i].y + 42, 7, sel ? C_ORG : C_BORDER);
-        text(fBody, items[i], mx + 64, rcHome[i].y + 14, C_TEXT);
-        text(fSmall, subs[i], mx + 64, rcHome[i].y + 46, C_DIM);
+        fillRect(rcHome[i].x, rcHome[i].y, rcHome[i].w, rcHome[i].h, sel ? C_BORDER : C_PANEL);
+        if (sel) fillRect(rcHome[i].x, rcHome[i].y, 4, rcHome[i].h, C_ORG);
+        text(fBody, items[i], mx + 16, rcHome[i].y + 20, C_TEXT);
     }
-    text(fSmall, "Up/Down choose   A open   + exit", 640, 690, C_DIM, 1);
+    
+    text(fSmall, "Up/Down navigate • A select • + exit", W/2, 690, C_DIM, 1);
 }
 
 static void drawComps() {
     fillRect(0, 0, W, H, C_BG);
-    header("Choose what to install");
-    text(fSmall, "Existing files are backed up. Your games, saves and emuMMC are never touched.", 40, 84, C_DIM);
+    
+    // Header
+    fillRect(0, 0, W, 100, C_PANEL);
+    fillRect(0, 95, W, 2, C_ORG);
+    drawLogo14(50, 50, 40);
+    text(fTitle, "Choose Components to Install", 110, 30, C_TEXT);
+    text(fSmall, "Select components, check for updates", 110, 70, C_DIM);
+    
+    // Component list
     int n = (int)comps.size();
     if (compSel < compTop) compTop = compSel;
     if (compSel >= compTop + ROWS_VISIBLE) compTop = compSel - ROWS_VISIBLE + 1;
+    
     for (int r = 0; r < ROWS_VISIBLE; r++) {
         int i = compTop + r;
         rcRows[r] = {0, 0, 0, 0};
         if (i >= n) continue;
         Component& c = comps[i];
-        int y = 112 + r * 64;
-        rcRows[r] = {40, y, W - 80, 58};
+        int y = 120 + r * 60;
+        rcRows[r] = {40, y, W - 80, 55};
         bool sel = i == compSel;
-        panel(40, y, W - 80, 58, 14, sel ? C_CARD2 : C_CARD, sel ? C_CYAN : C_BORDER);
-        checkbox(58, y + 15, 28, c.selected);
-        text(fBody, c.name, 104, y + 6, C_TEXT);
-        text(fSmall, fit(fSmall, c.desc, 700), 104, y + 33, C_DIM);
-        int rx = W - 60;
+        
+        fillRect(40, y, W - 80, 55, sel ? C_BORDER : C_PANEL);
+        if (sel) fillRect(40, y, 3, 55, C_ORG);
+        
+        checkbox(60, y + 14, 24, c.selected);
+        text(fBody, c.name, 100, y + 8, C_TEXT);
+        text(fSmall, fit(fSmall, c.desc, 600), 100, y + 32, C_DIM);
+        
         if (c.installed) {
-            int bw = textW(fSmall, "Installed") + 28;
-            panel(rx - bw, y + 15, bw, 28, 14, C_CARD, C_OK);
-            text(fSmall, "Installed", rx - bw / 2, y + 19, C_OK, 1);
-            rx -= bw + 12;
-        } else {
-            int bw = textW(fSmall, "Not installed") + 28;
-            panel(rx - bw, y + 15, bw, 28, 14, C_CARD, C_BORDER);
-            text(fSmall, "Not installed", rx - bw / 2, y + 19, C_DIM, 1);
-            rx -= bw + 12;
+            text(fSmall, "✓ Installed", W - 200, y + 16, C_OK);
         }
-        if (!c.latest.empty()) text(fSmall, "latest " + c.latest, rx, y + 19, C_CYAN, 2);
     }
-    if (n > ROWS_VISIBLE) text(fSmall, std::to_string(compSel + 1) + " / " + std::to_string(n), W - 40, 84, C_DIM, 2);
-    rcBack = {40, 640, 150, 44};
-    rcCheck = {206, 640, 230, 44};
-    rcAll = {452, 640, 200, 44};
-    rcInstall = {W - 40 - 260, 640, 260, 44};
-    button(rcBack, "B  Back", false);
-    button(rcCheck, "X  Check updates", false);
-    button(rcAll, "Y  Select all", false);
-    button(rcInstall, "+  Install (" + std::to_string(selectedCount()) + ")", true);
+    
+    // Buttons
+    rcBack = {40, 640, 140, 44};
+    rcCheck = {196, 640, 200, 44};
+    rcAll = {412, 640, 160, 44};
+    rcInstall = {W - 240, 640, 240, 44};
+    
+    button(rcBack, "B Back");
+    button(rcCheck, "X Check Updates");
+    button(rcAll, "Y Select All");
+    button(rcInstall, "+ Install (" + std::to_string(selectedCount()) + ")", true);
 }
 
 static void drawSettings() {
     fillRect(0, 0, W, H, C_BG);
-    header("Settings");
-    struct Row { const char* t; const char* s; bool on; bool isToggle; std::string v; };
-    Row rows[5] = {
-        {"Back up before overwriting", "Copies every file it would replace to switch/14CFW/backup", opts.backup, true, ""},
-        {"Keep my existing settings", "Never overwrites config files you already have (ini, json, cfg)", opts.keepConfigs, true, ""},
-        {"Install the 14CFW boot menu", "Also writes the custom Hekate menu, logo and icon", opts.withBootMenu, true, ""},
-        {"Boot menu mode", "", false, false, opts.replaceMenu ? "Replace main menu (old one backed up)" : "Add as an extra config"},
-        {"Certificate check", "", false, false, env.tlsOk ? "ON" : "OFF  (put cacert.pem in switch/14CFW)"},
+    
+    // Header
+    fillRect(0, 0, W, 100, C_PANEL);
+    fillRect(0, 95, W, 2, C_ORG);
+    drawLogo14(50, 50, 40);
+    text(fTitle, "Installation Settings", 110, 30, C_TEXT);
+    
+    struct Row { const char* t; const char* s; bool on; };
+    Row rows[4] = {
+        {"Create backups", "Save overwritten files to switch/14CFW/backup", opts.backup},
+        {"Keep existing configs", "Never overwrite .ini, .json, .cfg files", opts.keepConfigs},
+        {"Install boot menu", "Add 14CFW Hekate menu with custom logo", opts.withBootMenu},
+        {"Replace main menu", "Use as primary menu (old menu backed up)", opts.replaceMenu},
     };
-    for (int i = 0; i < 5; i++) {
-        int y = 100 + i * 96;
-        rcSet[i] = {40, y, W - 80, 84};
+    
+    for (int i = 0; i < 4; i++) {
+        int y = 130 + i * 110;
+        rcSet[i] = {40, y, W - 80, 100};
         bool sel = i == setSel;
-        panel(40, y, W - 80, 84, 16, sel ? C_CARD2 : C_CARD, sel ? C_CYAN : C_BORDER);
+        
+        fillRect(40, y, W - 80, 100, sel ? C_BORDER : C_PANEL);
+        if (sel) fillRect(40, y, 3, 100, C_ORG);
+        
         text(fBody, rows[i].t, 70, y + 14, C_TEXT);
-        if (rows[i].isToggle) {
-            text(fSmall, rows[i].s, 70, y + 48, C_DIM);
-            toggle(W - 40 - 30 - 56, y + 27, rows[i].on);
-        } else {
-            text(fSmall, rows[i].v, 70, y + 48, i == 4 && !env.tlsOk ? C_WARN : C_CYAN);
-        }
+        text(fSmall, rows[i].s, 70, y + 48, C_DIM);
+        toggle(W - 100, y + 30, rows[i].on);
     }
-    rcBack = {40, 640, 150, 44};
-    button(rcBack, "B  Back", false);
-    text(fSmall, "A change", W - 40, 654, C_DIM, 2);
+    
+    rcBack = {40, 640, 140, 44};
+    button(rcBack, "B Back");
+    text(fSmall, "A to toggle • B to go back", W - 40, 654, C_DIM, 2);
 }
 
 static void drawConfirm() {
     fillRect(0, 0, W, H, C_BG);
-    header("Ready to install");
-    panel(120, 100, W - 240, 520, 20, C_CARD, C_BORDER);
-    int y = 122;
-    text(fBody, "This will install:", 160, y, C_TEXT);
+    
+    // Header
+    fillRect(0, 0, W, 100, C_PANEL);
+    fillRect(0, 95, W, 2, C_ORG);
+    text(fTitle, "Ready to Install?", 40, 35, C_TEXT);
+    
+    // Summary panel
+    fillRect(60, 120, W - 120, 500, C_PANEL);
+    fillRect(60, 120, W - 120, 2, C_ORG);
+    
+    int y = 140;
+    text(fBody, "The following will be installed:", 80, y, C_ORG);
     y += 40;
+    
     int shown = 0;
     for (auto& c : comps)
         if (c.selected && !menuOnly) {
-            if (shown++ < 7) text(fBody, "+  " + c.name + (c.installed ? "   (update)" : ""), 180, y, C_CYAN);
-            else if (shown == 8) text(fSmall, "and more...", 180, y, C_DIM);
-            if (shown <= 7) y += 32;
+            if (shown++ < 8) {
+                text(fSmall, "• " + c.name + (c.installed ? " (update)" : ""), 100, y, C_TEXT);
+                y += 28;
+            }
         }
-    if (opts.withBootMenu || menuOnly) { text(fBody, "+  14CFW boot menu", 180, y, C_ORG); y += 32; }
-    y = std::max(y + 10, 420);
-    text(fSmall, "Games, saves and emuMMC are never touched.", 160, y, C_OK); y += 26;
-    text(fSmall, opts.backup ? "Replaced files are backed up first (switch/14CFW/backup)." : "Backups are OFF. Replaced files cannot be restored.", 160, y, opts.backup ? C_OK : C_WARN); y += 26;
-    text(fSmall, opts.keepConfigs ? "Your existing config files are kept." : "Existing config files may be overwritten.", 160, y, opts.keepConfigs ? C_OK : C_WARN); y += 26;
-    if (env.battery >= 0 && env.battery < 30 && !env.charging) text(fSmall, "Battery is low. Plug in the charger.", 160, y, C_ERR);
-    rcGo = {W / 2 + 20, 640, 240, 44};
-    rcCancel = {W / 2 - 180, 640, 180, 44};
-    button(rcCancel, "B  Cancel", false);
-    button(rcGo, "A  Start", true);
+    
+    if (opts.withBootMenu || menuOnly) {
+        text(fSmall, "• 14CFW Boot Menu", 100, y, C_ORG);
+        y += 28;
+    }
+    
+    y += 20;
+    text(fSmall, "✓ Your games, saves and emuMMC are protected", 80, y, C_OK);
+    y += 28;
+    text(fSmall, opts.backup ? "✓ Backups enabled" : "⚠ Backups disabled", 80, y, opts.backup ? C_OK : C_WARN);
+    y += 28;
+    text(fSmall, opts.keepConfigs ? "✓ Existing configs will be kept" : "⚠ Configs may be overwritten", 80, y, opts.keepConfigs ? C_OK : C_WARN);
+    
+    rcCancel = {W / 2 - 180, 640, 160, 44};
+    rcGo = {W / 2 + 20, 640, 160, 44};
+    button(rcCancel, "B Cancel");
+    button(rcGo, "A Install", true);
 }
 
 static void drawRun(Uint32 tick) {
     fillRect(0, 0, W, H, C_BG);
-    const char* title = jobKind == J_CHECK ? "Checking for updates" : (jobKind == J_MENU ? "Installing boot menu" : "Installing");
-    header(title);
+    
+    // Header
+    fillRect(0, 0, W, 100, C_PANEL);
+    fillRect(0, 95, W, 2, C_ORG);
+    text(fTitle, jobKind == J_CHECK ? "Checking Updates" : "Installing", 40, 35, C_TEXT);
+    
     std::string step;
     std::vector<std::string> lg;
     float ov = 0, sub = 0;
@@ -424,56 +493,80 @@ static void drawRun(Uint32 tick) {
         ov = prog->overall;
         sub = prog->sub;
     }
-    panel(60, 100, W - 120, 120, 20, C_CARD, C_BORDER);
+    
+    // Progress section
+    fillRect(60, 120, W - 120, 100, C_PANEL);
+    fillRect(60, 120, W - 120, 2, C_ORG);
+    
     std::string dots(1 + (tick / 400) % 3, '.');
-    text(fBody, (step.empty() ? std::string("Starting") : step) + dots, 90, 118, C_TEXT);
-    progressBar(90, 160, W - 180, 14, ov);
-    progressBar(90, 186, W - 180, 8, sub);
-    panel(60, 236, W - 120, 380, 20, C_CARD, C_BORDER);
+    text(fBody, (step.empty() ? std::string("Starting") : step) + dots, 80, 140, C_TEXT);
+    progressBar(80, 180, W - 160, 12, ov);
+    progressBar(80, 200, W - 160, 6, sub);
+    
+    // Log section
+    fillRect(60, 240, W - 120, 350, C_PANEL);
+    fillRect(60, 240, W - 120, 2, C_ORG);
+    
     int maxl = 11;
     int start = lg.size() > (size_t)maxl ? (int)lg.size() - maxl : 0;
     for (int i = start; i < (int)lg.size(); i++) {
         const std::string& s = lg[i];
-        SDL_Color col = s.find("FAILED") != std::string::npos || s.find("  !") == 0 ? C_ERR : (s.find("  =") == 0 ? C_DIM : C_TEXT);
-        text(fSmall, fit(fSmall, s, W - 180), 90, 254 + (i - start) * 31, col);
+        SDL_Color col = s.find("FAILED") != std::string::npos ? C_ERR : C_TEXT;
+        text(fSmall, fit(fSmall, s, W - 160), 80, 260 + (i - start) * 28, col);
     }
+    
     rcCancel = {W / 2 - 160, 640, 320, 44};
-    button(rcCancel, prog && prog->cancel ? "Stopping after this file..." : "B  Cancel", false);
-    text(fSmall, "Do not turn off the console while this is running.", W / 2, 690, C_WARN, 1);
+    button(rcCancel, prog && prog->cancel ? "Stopping..." : "B Cancel");
+    text(fSmall, "Do not power off your Switch", W / 2, 690, C_WARN, 1);
 }
 
 static void drawDone() {
     fillRect(0, 0, W, H, C_BG);
-    header("Finished");
+    
+    // Header
+    fillRect(0, 0, W, 100, C_PANEL);
+    fillRect(0, 95, W, 2, C_ORG);
+    text(fTitle, "Installation Complete", 40, 35, C_TEXT);
+    
     bool bad = prog && (prog->failedHard || prog->failed > 0);
-    panel(120, 100, W - 240, 520, 20, C_CARD, C_BORDER);
-    circle(W / 2, 170, 42, bad ? C_WARN : C_OK);
-    if (bad) { line(W / 2, 150, W / 2, 175, C_BG, 5); fillRect(W / 2 - 3, 186, 7, 7, C_BG); }
-    else { line(W / 2 - 18, 172, W / 2 - 4, 188, C_BG, 6); line(W / 2 - 4, 188, W / 2 + 22, 154, C_BG, 6); }
-    std::string sum, bdir;
+    
+    // Result panel
+    fillRect(120, 130, W - 240, 470, C_PANEL);
+    fillRect(120, 130, W - 240, 2, bad ? C_ERR : C_ORG);
+    
+    // Status icon
+    int icon_y = 180;
+    if (bad) {
+        circle(W / 2, icon_y, 35, C_ERR);
+        line(W / 2 - 12, icon_y - 8, W / 2 + 12, icon_y + 8, C_BG, 4);
+    } else {
+        circle(W / 2, icon_y, 35, C_OK);
+        line(W / 2 - 15, icon_y, W / 2 - 5, icon_y + 12, C_BG, 4);
+        line(W / 2 - 5, icon_y + 12, W / 2 + 15, icon_y - 12, C_BG, 4);
+    }
+    
+    text(fTitle, bad ? "Completed with errors" : "All done!", W / 2, 260, C_TEXT, 1);
+    
     std::vector<std::string> lg;
     if (prog) {
         std::lock_guard<std::mutex> g(prog->mu);
-        sum = prog->summary;
-        bdir = prog->backupDir;
         lg = prog->log;
     }
-    text(fTitle, bad ? "Done, with some problems" : "All done", W / 2, 232, C_TEXT, 1);
-    if (!sum.empty()) text(fSmall, sum, W / 2, 278, C_DIM, 1);
-    int y = 316;
+    
+    int y = 320;
     int shown = 0;
-    for (int i = (int)lg.size() - 1; i >= 0 && shown < 6; i--)
-        if (lg[i].find("FAILED") != std::string::npos || lg[i].find("Not enough") != std::string::npos || lg[i].find("Battery") != std::string::npos) {
-            text(fSmall, fit(fSmall, lg[i], W - 320), 160, y, C_ERR);
+    for (int i = (int)lg.size() - 1; i >= 0 && shown < 4; i--) {
+        if (lg[i].find("FAILED") != std::string::npos) {
+            text(fSmall, "✗ " + fit(fSmall, lg[i], W - 280), 150, y, C_ERR);
             y += 28;
             shown++;
         }
-    y = std::max(y + 10, 440);
-    if (!bdir.empty() && opts.backup) text(fSmall, "Backups: " + bdir.substr(6), 160, y, C_DIM), y += 28;
-    text(fBody, "Restart your Switch to apply the changes.", W / 2, 520, C_CYAN, 1);
-    text(fSmall, "Hold Power, then choose Power Options, then Restart.", W / 2, 556, C_DIM, 1);
+    }
+    
+    text(fSmall, "Restart your Switch to apply changes", W / 2, 480, C_DIM, 1);
+    
     rcGo = {W / 2 - 130, 640, 260, 44};
-    button(rcGo, "A  Back to menu", true);
+    button(rcGo, "A Back to Menu", true);
 }
 
 // ------------------------------------------------------------------ actions
@@ -481,7 +574,7 @@ static void homeAction(int i) {
     if (i == 0) { menuOnly = false; screen = COMPS; }
     else if (i == 1) { menuOnly = true; screen = CONFIRM; }
     else if (i == 2) { screen = SETTINGS; }
-    else if (i == 3) { rescan(); toast("SD card scanned"); }
+    else if (i == 3) { rescan(); toast("Status refreshed"); }
 }
 
 static bool wantExit = false;
@@ -529,7 +622,7 @@ static void onTap(int x, int y) {
             }
     } else if (screen == SETTINGS) {
         if (hit(rcBack, x, y)) { screen = HOME; return; }
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 4; i++)
             if (hit(rcSet[i], x, y)) { setSel = i; toggleSetting(i); }
     } else if (screen == CONFIRM) {
         if (hit(rcCancel, x, y)) screen = HOME;
@@ -617,8 +710,8 @@ int main(int, char**) {
                 break;
             }
             case SETTINGS:
-                if (down & HidNpadButton_Up) setSel = (setSel + 4) % 5;
-                if (down & HidNpadButton_Down) setSel = (setSel + 1) % 5;
+                if (down & HidNpadButton_Up) setSel = (setSel + 3) % 4;
+                if (down & HidNpadButton_Down) setSel = (setSel + 1) % 4;
                 if (down & HidNpadButton_A) toggleSetting(setSel);
                 if (down & HidNpadButton_B) screen = HOME;
                 break;
@@ -646,7 +739,8 @@ int main(int, char**) {
             }
             if (SDL_GetTicks() < toastUntil) {
                 int w = textW(fSmall, toastMsg) + 44;
-                panel(W / 2 - w / 2, 590, w, 40, 20, C_CARD2, C_CYAN);
+                fillRect(W / 2 - w / 2, 590, w, 40, C_PANEL);
+                fillRect(W / 2 - w / 2, 590, w, 2, C_ORG);
                 text(fSmall, toastMsg, W / 2, 600, C_TEXT, 1);
             }
             SDL_RenderPresent(R);
