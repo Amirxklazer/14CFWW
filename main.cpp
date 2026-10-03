@@ -391,9 +391,9 @@ static void drawComps() {
     rcAll = {412, 640, 160, 44};
     rcInstall = {W - 240, 640, 240, 44};
     
-    button(rcBack, "B Back");
-    button(rcCheck, "X Check Updates");
-    button(rcAll, "Y Select All");
+    button(rcBack, "B Back", false);
+    button(rcCheck, "X Check Updates", false);
+    button(rcAll, "Y Select All", false);
     button(rcInstall, "+ Install (" + std::to_string(selectedCount()) + ")", true);
 }
 
@@ -428,7 +428,7 @@ static void drawSettings() {
     }
     
     rcBack = {40, 640, 140, 44};
-    button(rcBack, "B Back");
+    button(rcBack, "B Back", false);
     text(fSmall, "A to toggle • B to go back", W - 40, 654, C_DIM, 2);
 }
 
@@ -471,7 +471,7 @@ static void drawConfirm() {
     
     rcCancel = {W / 2 - 180, 640, 160, 44};
     rcGo = {W / 2 + 20, 640, 160, 44};
-    button(rcCancel, "B Cancel");
+    button(rcCancel, "B Cancel", false);
     button(rcGo, "A Install", true);
 }
 
@@ -516,7 +516,7 @@ static void drawRun(Uint32 tick) {
     }
     
     rcCancel = {W / 2 - 160, 640, 320, 44};
-    button(rcCancel, prog && prog->cancel ? "Stopping..." : "B Cancel");
+    button(rcCancel, prog && prog->cancel ? "Stopping..." : "B Cancel", false);
     text(fSmall, "Do not power off your Switch", W / 2, 690, C_WARN, 1);
 }
 
