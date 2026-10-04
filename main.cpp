@@ -1,764 +1,834 @@
-#include <switch.h>
-#include <curl/curl.h>
+// 14CFW - Windows 10 OOBE style installer for Atmosphere + Hekate + homebrew
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
-#include <sys/stat.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 #include "installer.hpp"
+#include "logo.hpp"
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
-static const int W = 1280, H = 720;
-// Windows 10 OOBE Orange/Black theme
-static const SDL_Color C_BG{20, 20, 20, 255},          // Dark background
-    C_PANEL{30, 30, 30, 255},                          // Panel background
-    C_BORDER{50, 50, 50, 255},                         // Border color
-    C_TEXT{240, 240, 240, 255},                        // Main text (light gray)
-    C_DIM{140, 140, 140, 255},                         // Dimmed text
-    C_ORG{255, 140, 0, 255},                           // Orange accent
-    C_ORG_DARK{200, 100, 0, 255},                      // Darker orange
-    C_OK{76, 175, 80, 255},                            // Green for success
-    C_ERR{244, 67, 54, 255},                           // Red for error
-    C_WHITE{255, 255, 255, 255},                       // White
-    C_WARN{255, 152, 0, 255};                          // Amber for warning
+static const int W = 1280, H = 720, MX = 96;
 
-static const char* SETTINGS_PATH = "sdmc:/switch/14CFW/settings.txt";
+// ------------------------------------------------------------------ input
+enum { K_A = 1, K_B = 2, K_X = 4, K_Y = 8, K_UP = 16, K_DOWN = 32, K_LEFT = 64, K_RIGHT = 128, K_PLUS = 256 };
+struct In {
+    unsigned down = 0;
+    bool tap = false;
+    int tx = 0, ty = 0;
+};
 
-static SDL_Renderer* R;
-static TTF_Font *fBody, *fSmall, *fTitle, *fBig;
+// ------------------------------------------------------------------ globals
+static SDL_Window* g_win = nullptr;
+static SDL_Renderer* g_r = nullptr;
+static TTF_Font *fS, *fB, *fM, *fL, *fXL;
+static SDL_Texture *texBG, *texBig, *texIcon, *texCircle;
+static float g_alpha = 1.f;  // page fade
+static int g_dx = 0;         // page slide
+static bool g_quit = false, g_reboot = false;
+
+static const SDL_Color WHITE{255, 255, 255, 255}, ACCENT{0, 120, 215, 255}, DIM{198, 214, 236, 255}, GOOD{150, 232, 170, 255},
+    WARN{255, 208, 110, 255}, BAD{255, 150, 140, 255};
 
 // ------------------------------------------------------------------ drawing helpers
-static void fillRect(int x, int y, int w, int h, SDL_Color c) {
-    SDL_SetRenderDrawColor(R, c.r, c.g, c.b, c.a);
-    SDL_Rect r{x, y, w, h};
-    SDL_RenderFillRect(R, &r);
-}
-
-static void rrect(int x, int y, int w, int h, int r, SDL_Color c) {
-    if (r * 2 > h) r = h / 2;
-    if (r * 2 > w) r = w / 2;
-    SDL_SetRenderDrawColor(R, c.r, c.g, c.b, c.a);
-    for (int i = 0; i < r; i++) {
-        double dy = r - i - 0.5;
-        int inset = r - (int)std::lround(std::sqrt((double)r * r - dy * dy));
-        SDL_Rect a{x + inset, y + i, w - 2 * inset, 1};
-        SDL_Rect b{x + inset, y + h - 1 - i, w - 2 * inset, 1};
-        SDL_RenderFillRect(R, &a);
-        SDL_RenderFillRect(R, &b);
+struct TT {
+    SDL_Texture* t;
+    int w, h;
+};
+static std::map<std::string, TT> g_tc;
+static TT getText(TTF_Font* f, const std::string& s) {
+    char key[32];
+    snprintf(key, sizeof key, "%p|", (void*)f);
+    std::string k = key + s;
+    auto it = g_tc.find(k);
+    if (it != g_tc.end()) return it->second;
+    if (g_tc.size() > 300) {
+        for (auto& p : g_tc) SDL_DestroyTexture(p.second.t);
+        g_tc.clear();
     }
-    SDL_Rect m{x, y + r, w, h - 2 * r};
-    SDL_RenderFillRect(R, &m);
-}
-
-static void circle(int cx, int cy, int r, SDL_Color c) { 
-    rrect(cx - r, cy - r, 2 * r, 2 * r, r, c); 
-}
-
-static void panel(int x, int y, int w, int h, int r, SDL_Color fill, SDL_Color border) {
-    rrect(x, y, w, h, r, border);
-    rrect(x + 1, y + 1, w - 2, h - 2, r - 1 > 0 ? r - 1 : 1, fill);
-}
-
-static void line(int x1, int y1, int x2, int y2, SDL_Color c, int t) {
-    SDL_SetRenderDrawColor(R, c.r, c.g, c.b, c.a);
-    for (int o = -(t / 2); o <= t / 2; o++) {
-        SDL_RenderDrawLine(R, x1 + o, y1, x2 + o, y2);
-        SDL_RenderDrawLine(R, x1, y1 + o, x2, y2 + o);
-    }
-}
-
-// Draw outlined "14" logo with checkmark style
-static void drawLogo14(int cx, int cy, int size) {
-    int thick = size / 8;
-    SDL_Color col = C_ORG;
-    
-    // "1" - vertical line
-    fillRect(cx - size/4, cy - size/3, thick, 2*size/3, col);
-    
-    // "4" - outlined style
-    fillRect(cx + size/8, cy - size/3, thick, size/3, col);  // vertical top
-    fillRect(cx + size/8, cy, thick * 2, thick, col);         // horizontal middle
-    fillRect(cx + size/8 + thick, cy, thick, size/3, col);    // vertical bottom
-    
-    // Checkmark accent on side (small)
-    int ck_x = cx + size/2 + size/8;
-    int ck_y = cy + size/6;
-    line(ck_x - thick, ck_y, ck_x + thick/2, ck_y + thick*2, C_ORG, thick);
-    line(ck_x + thick/2, ck_y + thick*2, ck_x + thick*3, ck_y - thick, C_ORG, thick);
-}
-
-struct CT { SDL_Texture* t; int w, h; };
-static std::map<std::string, CT> tcache;
-static CT getText(TTF_Font* f, const std::string& s, SDL_Color c) {
-    char kb[48];
-    snprintf(kb, sizeof kb, "%p|%02x%02x%02x|", (void*)f, c.r, c.g, c.b);
-    std::string key = std::string(kb) + s;
-    auto it = tcache.find(key);
-    if (it != tcache.end()) return it->second;
-    if (tcache.size() > 500) {
-        for (auto& kv : tcache)
-            if (kv.second.t) SDL_DestroyTexture(kv.second.t);
-        tcache.clear();
-    }
-    CT ct{nullptr, 0, 0};
-    SDL_Surface* sf = TTF_RenderUTF8_Blended(f, s.c_str(), c);
+    TT t{nullptr, 0, 0};
+    SDL_Surface* sf = TTF_RenderUTF8_Blended(f, s.c_str(), WHITE);
     if (sf) {
-        ct.t = SDL_CreateTextureFromSurface(R, sf);
-        ct.w = sf->w;
-        ct.h = sf->h;
+        t.t = SDL_CreateTextureFromSurface(g_r, sf);
+        t.w = sf->w;
+        t.h = sf->h;
+        SDL_SetTextureBlendMode(t.t, SDL_BLENDMODE_BLEND);
         SDL_FreeSurface(sf);
     }
-    tcache[key] = ct;
-    return ct;
+    g_tc[k] = t;
+    return t;
 }
-
-static int text(TTF_Font* f, const std::string& s, int x, int y, SDL_Color c, int align = 0) {
-    if (s.empty() || !f) return 0;
-    CT ct = getText(f, s, c);
-    if (!ct.t) return 0;
-    int dx = align == 1 ? x - ct.w / 2 : (align == 2 ? x - ct.w : x);
-    SDL_Rect d{dx, y, ct.w, ct.h};
-    SDL_RenderCopy(R, ct.t, nullptr, &d);
-    return ct.w;
-}
-
 static int textW(TTF_Font* f, const std::string& s) {
     int w = 0, h = 0;
     TTF_SizeUTF8(f, s.c_str(), &w, &h);
     return w;
 }
-
-static std::string fit(TTF_Font* f, std::string s, int maxW) {
-    if (textW(f, s) <= maxW) return s;
-    while (!s.empty()) {
-        size_t i = s.size() - 1;
-        while (i > 0 && (s[i] & 0xC0) == 0x80) i--;
-        s.erase(i);
-        if (textW(f, s + "...") <= maxW) return s + "...";
+// align: 0 left, 1 center, 2 right. returns width
+static int text(TTF_Font* f, const std::string& s, int x, int y, SDL_Color c, int a = 255, int align = 0, bool slide = true) {
+    if (s.empty()) return 0;
+    TT t = getText(f, s);
+    if (!t.t) return 0;
+    int px = align == 0 ? x : align == 1 ? x - t.w / 2 : x - t.w;
+    if (slide) px += g_dx;
+    SDL_SetTextureColorMod(t.t, c.r, c.g, c.b);
+    SDL_SetTextureAlphaMod(t.t, (Uint8)(a * g_alpha));
+    SDL_Rect d{px, y, t.w, t.h};
+    SDL_RenderCopy(g_r, t.t, nullptr, &d);
+    return t.w;
+}
+static int wrap(TTF_Font* f, const std::string& s, int x, int y, int maxw, SDL_Color c, int lh, int a = 255) {
+    std::string line, word;
+    auto flush = [&]() {
+        text(f, line, x, y, c, a);
+        y += lh;
+        line.clear();
+    };
+    for (size_t i = 0; i <= s.size(); i++) {
+        if (i == s.size() || s[i] == ' ') {
+            std::string t = line.empty() ? word : line + " " + word;
+            if (!line.empty() && textW(f, t) > maxw) {
+                flush();
+                line = word;
+            } else
+                line = t;
+            word.clear();
+        } else
+            word += s[i];
     }
-    return "...";
+    if (!line.empty()) flush();
+    return y;
 }
-
-static SDL_Color mix(SDL_Color a, SDL_Color b, float t) {
-    return SDL_Color{(Uint8)(a.r + (b.r - a.r) * t), (Uint8)(a.g + (b.g - a.g) * t), (Uint8)(a.b + (b.b - a.b) * t), 255};
+static void fillRect(int x, int y, int w, int h, SDL_Color c, int a = 255, bool slide = true) {
+    SDL_SetRenderDrawBlendMode(g_r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(g_r, c.r, c.g, c.b, (Uint8)(a * g_alpha));
+    SDL_Rect r{x + (slide ? g_dx : 0), y, w, h};
+    SDL_RenderFillRect(g_r, &r);
 }
-
-static void progressBar(int x, int y, int w, int h, float v) {
-    fillRect(x, y, w, h, C_BORDER);
-    if (v < 0) v = 0;
-    if (v > 1) v = 1;
-    int fw = (int)(w * v);
-    if (fw > 0) fillRect(x, y, fw, h, C_ORG);
+static void strokeRect(int x, int y, int w, int h, int t, SDL_Color c, int a = 255) {
+    fillRect(x, y, w, t, c, a);
+    fillRect(x, y + h - t, w, t, c, a);
+    fillRect(x, y, t, h, c, a);
+    fillRect(x + w - t, y, t, h, c, a);
 }
-
-static void checkbox(int x, int y, int s, bool on) {
-    fillRect(x, y, s, s, on ? C_BORDER : C_BORDER);
+static void circle(float cx, float cy, float r, SDL_Color c, int a = 255, bool slide = true) {
+    SDL_SetTextureColorMod(texCircle, c.r, c.g, c.b);
+    SDL_SetTextureAlphaMod(texCircle, (Uint8)(a * g_alpha));
+    SDL_Rect d{(int)(cx - r + (slide ? g_dx : 0)), (int)(cy - r), (int)(2 * r), (int)(2 * r)};
+    SDL_RenderCopy(g_r, texCircle, nullptr, &d);
+}
+static void chip(const std::string& l, int x, int y) {  // button glyph: ring + letter
+    circle(x + 11, y + 11, 11, WHITE, 255, false);
+    circle(x + 11, y + 11, 9, SDL_Color{12, 52, 104, 255}, 255, false);
+    text(fS, l, x + 11, y + 1, WHITE, 255, 1, false);
+}
+static void toggle(int x, int y, bool on, bool dis) {  // pill 52x26
+    int a = dis ? 120 : 255;
     if (on) {
-        line(x + 4, y + s/2, x + s/2 - 2, y + s - 6, C_ORG, 3);
-        line(x + s/2 - 2, y + s - 6, x + s - 4, y + 4, C_ORG, 3);
+        circle(x + 13, y + 13, 13, ACCENT, a);
+        circle(x + 39, y + 13, 13, ACCENT, a);
+        fillRect(x + 13, y, 26, 26, ACCENT, a);
+        circle(x + 39, y + 13, 7, WHITE, a);
+    } else {
+        circle(x + 13, y + 13, 13, WHITE, a);
+        circle(x + 39, y + 13, 13, WHITE, a);
+        fillRect(x + 13, y, 26, 26, WHITE, a);
+        circle(x + 13, y + 13, 11, SDL_Color{10, 48, 98, 255}, a);
+        circle(x + 39, y + 13, 11, SDL_Color{10, 48, 98, 255}, a);
+        fillRect(x + 13, y + 2, 26, 22, SDL_Color{10, 48, 98, 255}, a);
+        circle(x + 13, y + 13, 6, WHITE, a);
     }
 }
-
-static void toggle(int x, int y, bool on) {
-    fillRect(x, y, 56, 30, C_BORDER);
-    fillRect(on ? x + 28 : x + 2, y + 2, 26, 26, on ? C_ORG : C_DIM);
-}
-
-struct Rc { int x = 0, y = 0, w = 0, h = 0; };
-static bool hit(const Rc& r, int px, int py) { return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h; }
-
-static void button(const Rc& r, const std::string& label, bool primary) {
-    if (primary) {
-        fillRect(r.x, r.y, r.w, r.h, C_ORG);
-        text(fSmall, label, r.x + r.w / 2, r.y + (r.h - 20) / 2, C_BG, 1);
-    } else {
-        fillRect(r.x, r.y, r.w, r.h, C_BORDER);
-        text(fSmall, label, r.x + r.w / 2, r.y + (r.h - 20) / 2, C_TEXT, 1);
+static void spinner(float cx, float cy, float r, double t) {  // Windows-style five racing dots
+    for (int i = 0; i < 5; i++) {
+        double u = fmod(t / 2.4 - i * 0.075, 1.0);
+        if (u < 0) u += 1;
+        double e = u * u * (3 - 2 * u);
+        double ang = -M_PI / 2 + e * 2 * M_PI * 1.0;
+        double al = u < 0.04 ? u / 0.04 : (u > 0.96 ? (1 - u) / 0.04 : 1);
+        circle((float)(cx + cos(ang) * r), (float)(cy + sin(ang) * r), r * 0.115f, WHITE, (int)(255 * al));
     }
 }
 
 // ------------------------------------------------------------------ state
-enum Screen { HOME, COMPS, SETTINGS, CONFIRM, RUN, DONE };
-enum JobKind { J_NONE, J_INSTALL, J_MENU, J_CHECK };
+enum Page { P_HELLO, P_SCAN, P_FOUND, P_MODE, P_CORE, P_APPS, P_OPTS, P_INSTALL, P_DONE, P_ERROR };
+enum Act { A_NONE, A_START, A_NEXT, A_BACK, A_EXPRESS, A_CUSTOM, A_INSTALL, A_EXIT, A_REBOOT, A_RETRY };
 
-static Screen screen = HOME;
-static bool menuOnly = false;
-static std::vector<Component> comps;
-static Env env;
-static Options opts;
-static int homeSel = 0, compSel = 0, compTop = 0, setSel = 0;
-static const int ROWS_VISIBLE = 8;
-
-static Progress* prog = nullptr;
-static JobKind jobKind = J_NONE;
-static Thread worker;
-static bool workerValid = false;
-struct JobArg {
-    JobKind kind;
-    std::vector<Component> comps;
-    Options o;
-    Env env;
-    Progress* p;
+struct Row {
+    std::string title, sub, tag;
+    SDL_Color tagCol = WHITE;
+    bool* val = nullptr;  // toggle
+    bool dis = false;
 };
-static JobArg* curArg = nullptr;
+struct Btn {
+    std::string label;
+    Act act;
+    bool primary;
+    SDL_Rect r;
+};
 
-static std::string toastMsg;
-static Uint32 toastUntil = 0;
-static void toast(const std::string& s) {
-    toastMsg = s;
-    toastUntil = SDL_GetTicks() + 2600;
+static Page g_page = P_HELLO;
+static std::vector<Page> g_stack;
+static double g_pageT = 0, g_now = 0;
+static int g_focus = 0, g_scroll = 0;  // focus: row index, or rows.size()+btn index
+static Env g_env;
+static Plan g_plan;
+static bool g_ams = true, g_hek = true, g_menu = true, g_replace = true, g_backup = true;
+static std::vector<char> g_appOn;
+static double g_scanStart = 0;
+static Progress* g_pr = nullptr;
+static std::thread g_th;
+static bool g_installing = false;
+static std::vector<Row> g_rows;
+static std::vector<Btn> g_btns;
+static std::vector<SDL_Rect> g_rowRects;
+static bool g_confirmCancel = false;
+
+static void goPage(Page p, bool push = true) {
+    if (push) g_stack.push_back(g_page);
+    g_page = p;
+    g_pageT = g_now;
+    g_focus = 0;
+    g_scroll = 0;
+    if (p == P_SCAN) {
+        g_scanStart = g_now;
+        g_env = detectEnv();
+        if (g_appOn.size() != hbApps().size()) {
+            g_appOn.assign(hbApps().size(), 1);
+        }
+    }
+}
+static void goBack() {
+    if (g_stack.empty()) return;
+    Page p = g_stack.back();
+    g_stack.pop_back();
+    if (p == P_SCAN) {  // never land on the spinner
+        if (g_stack.empty()) return;
+        p = g_stack.back();
+        g_stack.pop_back();
+    }
+    goPage(p, false);
 }
 
-static Rc rcHome[5], rcRows[ROWS_VISIBLE], rcBack, rcCheck, rcAll, rcInstall, rcGo, rcCancel, rcSet[5];
-
-static void saveSettings() {
-    FILE* f = fopen(SETTINGS_PATH, "w");
-    if (!f) return;
-    fprintf(f, "backup=%d\nkeep=%d\nbootmenu=%d\nreplace=%d\n", opts.backup, opts.keepConfigs, opts.withBootMenu, opts.replaceMenu);
-    fclose(f);
+static void startInstall(bool express) {
+    g_plan = Plan();
+    if (express) {
+        g_plan.ams = g_plan.hekate = g_plan.bootMenu = true;
+        g_plan.replaceIni = g_plan.backup = true;
+        for (auto& a : hbApps()) g_plan.apps.push_back(a.id);
+    } else {
+        g_plan.ams = g_ams;
+        g_plan.hekate = g_hek;
+        g_plan.bootMenu = g_menu;
+        g_plan.replaceIni = g_replace;
+        g_plan.backup = g_backup;
+        for (size_t i = 0; i < hbApps().size(); i++)
+            if (g_appOn[i]) g_plan.apps.push_back(hbApps()[i].id);
+    }
+    if (g_th.joinable()) g_th.join();
+    delete g_pr;
+    g_pr = new Progress();
+    g_installing = true;
+    Plan p = g_plan;
+    Env e = g_env;
+    g_th = std::thread([p, e]() { runInstall(p, e, *g_pr); });
+    g_stack.clear();
+    goPage(P_INSTALL, false);
 }
 
-static void loadSettings() {
-    std::ifstream in(SETTINGS_PATH);
-    std::string l;
-    while (std::getline(in, l)) {
-        size_t e = l.find('=');
-        if (e == std::string::npos) continue;
-        std::string k = l.substr(0, e);
-        bool v = l.substr(e + 1).find('1') != std::string::npos;
-        if (k == "backup") opts.backup = v;
-        else if (k == "keep") opts.keepConfigs = v;
-        else if (k == "bootmenu") opts.withBootMenu = v;
-        else if (k == "replace") opts.replaceMenu = v;
+// ------------------------------------------------------------------ page content
+static std::string title, sub;
+static void buildPage() {
+    g_rows.clear();
+    g_btns.clear();
+    title = sub = "";
+    int by = 600, bh = 48;
+    auto addBtn = [&](const std::string& l, Act a, bool primary) { g_btns.push_back({l, a, primary, {0, by, std::max(150, textW(fB, l) + 56), bh}}); };
+    switch (g_page) {
+    case P_HELLO:
+        title = "Hi there";
+        sub = "Let's get your Switch set up with Atmosphère, Hekate and your favorite homebrew.";
+        addBtn("Let's go", A_START, true);
+        break;
+    case P_SCAN:
+        title = "Just a moment";
+        sub = "We're taking a look at your Switch. Nothing is changed during this step.";
+        break;
+    case P_FOUND: {
+        title = "Here's what we found";
+        sub = "Your games and saves are never touched by the installer.";
+        char t[96];
+        Row r;
+        r.title = "SD card";
+        snprintf(t, sizeof t, "%s free of %s", fmtBytes(g_env.sdFree).c_str(), fmtBytes(g_env.sdTotal).c_str());
+        r.tag = g_env.sdOk ? t : "Can't be read";
+        r.tagCol = g_env.sdOk && g_env.sdFree > 300ull * 1048576 ? GOOD : BAD;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Wi-Fi";
+        r.tag = g_env.online ? "Connected" : "Not connected";
+        r.tagCol = g_env.online ? GOOD : WARN;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Atmosphère";
+        r.tag = g_env.amsRunning ? "Running " + g_env.amsVer : g_env.amsFiles ? "Files found" : "Not installed";
+        r.tagCol = g_env.amsRunning || g_env.amsFiles ? GOOD : DIM;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Hekate";
+        r.tag = g_env.hekate ? "Found" : "Not installed";
+        r.tagCol = g_env.hekate ? GOOD : DIM;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "emuMMC";
+        r.tag = g_env.emummc ? "Found - will be left alone" : "Not found";
+        r.tagCol = g_env.emummc ? GOOD : DIM;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Your games";
+        r.tag = g_env.nintendo ? "Safe - never touched" : "Safe";
+        r.tagCol = GOOD;
+        g_rows.push_back(r);
+        int n = 0;
+        for (auto& a : hbApps()) n += appPresent(g_env, a);
+        r = Row();
+        r.title = "Pack apps already here";
+        snprintf(t, sizeof t, "%d of %d", n, (int)hbApps().size());
+        r.tag = t;
+        g_rows.push_back(r);
+        addBtn("Next", A_NEXT, true);
+        break;
+    }
+    case P_MODE:
+        title = "Get going fast";
+        sub = "Express installs Atmosphère, Hekate, the 14CFW boot menu and the homebrew pack. Your games, saves and settings stay exactly as they are.";
+        if (!g_env.online) {
+            Row r;
+            r.title = "Your Switch isn't online";
+            r.sub = "Connect to Wi-Fi in System Settings. The installer downloads everything fresh.";
+            r.dis = true;
+            r.tag = "!";
+            r.tagCol = WARN;
+            g_rows.push_back(r);
+        }
+        addBtn("Use Express settings", A_EXPRESS, true);
+        addBtn("Customize", A_CUSTOM, false);
+        break;
+    case P_CORE: {
+        title = "Customize your install";
+        sub = "Choose what goes on your SD card.";
+        Row r;
+        r.title = "Atmosphère";
+        r.sub = g_env.amsFiles ? "Custom firmware. Already here: will update, settings kept." : "Custom firmware for your Switch.";
+        r.val = &g_ams;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Hekate";
+        r.sub = g_env.hekate ? "Bootloader. Already here: will update." : "The bootloader that shows your boot menu.";
+        r.val = &g_hek;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "14CFW boot menu";
+        r.sub = (!g_hek && !g_env.hekate) ? "Needs Hekate. Turn Hekate on first." : "Your logo, icons and Atmosphère / emuMMC / sysMMC / Stock entries.";
+        r.val = &g_menu;
+        r.dis = !g_hek && !g_env.hekate;
+        g_rows.push_back(r);
+        addBtn("Back", A_BACK, false);
+        addBtn("Next", A_NEXT, true);
+        break;
+    }
+    case P_APPS:
+        title = "Homebrew pack";
+        sub = "Pick the apps you want. Ones you already have get updated.";
+        for (size_t i = 0; i < hbApps().size(); i++) {
+            Row r;
+            r.title = hbApps()[i].name;
+            r.sub = std::string(hbApps()[i].desc) + (appPresent(g_env, hbApps()[i]) ? "  -  already installed" : "");
+            r.val = (bool*)nullptr;
+            g_rows.push_back(r);
+        }
+        addBtn("Back", A_BACK, false);
+        addBtn("Next", A_NEXT, true);
+        break;
+    case P_OPTS: {
+        title = "A few more choices";
+        sub = "Almost there.";
+        Row r;
+        r.title = "Replace Hekate's boot menu";
+        r.sub = g_replace ? "14CFW becomes your boot menu. Your old one is backed up." : "Off: 14CFW is added under Hekate's More configs instead.";
+        r.val = &g_replace;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Back up files I replace";
+        r.sub = "Copies go to switch/14CFW/backup on your SD card.";
+        r.val = &g_backup;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Keep my games, saves and settings";
+        r.sub = "Always on. Nintendo, emuMMC and your keys are never written to.";
+        static bool always = true;
+        r.val = &always;
+        r.dis = true;
+        g_rows.push_back(r);
+        addBtn("Back", A_BACK, false);
+        addBtn("Install", A_INSTALL, true);
+        break;
+    }
+    case P_INSTALL:
+        title = "Setting things up";
+        sub = "This might take a few minutes. Don't turn off your Switch.";
+        break;
+    case P_DONE:
+        title = "All done!";
+        sub = "Restart, then pick Atmosphère from the 14CFW boot menu.";
+        addBtn("Back to menu", A_EXIT, false);
+        addBtn("Restart", A_REBOOT, true);
+        break;
+    case P_ERROR:
+        title = "Something went wrong";
+        addBtn("Exit", A_EXIT, false);
+        addBtn("Try again", A_RETRY, true);
+        break;
+    }
+    // right-align buttons
+    int x = W - MX;
+    for (int i = (int)g_btns.size() - 1; i >= 0; i--) {
+        x -= g_btns[i].r.w;
+        g_btns[i].r.x = x;
+        x -= 12;
     }
 }
 
-static void rescan() { inst::scan(comps, env); }
-
-static void jobThread(void* a) {
-    JobArg* j = (JobArg*)a;
-    if (j->kind == J_INSTALL) inst::install(j->comps, j->o, j->env, *j->p);
-    else if (j->kind == J_MENU) inst::installBootMenuOnly(j->o, j->env, *j->p);
-    else if (j->kind == J_CHECK) inst::checkUpdates(j->comps, *j->p);
+static bool rowOn(int i) {
+    if (g_page == P_APPS) return g_appOn[i];
+    return g_rows[i].val && *g_rows[i].val;
+}
+static bool rowIsToggle(int i) { return g_page == P_APPS || g_rows[i].val; }
+static void rowFlip(int i) {
+    if (g_rows[i].dis) return;
+    if (g_page == P_APPS) g_appOn[i] = !g_appOn[i];
+    else if (g_rows[i].val) *g_rows[i].val = !*g_rows[i].val;
 }
 
-static void joinWorker() {
-    if (workerValid) {
-        threadWaitForExit(&worker);
-        threadClose(&worker);
-        workerValid = false;
+static void doAct(Act a) {
+    switch (a) {
+    case A_START: goPage(P_SCAN); break;
+    case A_NEXT:
+        if (g_page == P_FOUND) goPage(P_MODE);
+        else if (g_page == P_CORE) goPage(P_APPS);
+        else if (g_page == P_APPS) goPage(P_OPTS);
+        break;
+    case A_BACK: goBack(); break;
+    case A_EXPRESS: startInstall(true); break;
+    case A_CUSTOM: goPage(P_CORE); break;
+    case A_INSTALL: startInstall(false); break;
+    case A_EXIT: g_quit = true; break;
+    case A_REBOOT: g_reboot = true; g_quit = true; break;
+    case A_RETRY: g_stack.clear(); goPage(P_FOUND, false); break;
+    default: break;
     }
-    delete curArg;
-    curArg = nullptr;
 }
 
-static void startJob(JobKind k) {
-    if (jobKind != J_NONE) return;
-    joinWorker();
-    delete prog;
-    prog = new Progress();
-    curArg = new JobArg{k, comps, opts, env, prog};
-    jobKind = k;
-    screen = RUN;
-    if (R_FAILED(threadCreate(&worker, jobThread, curArg, nullptr, 0x100000, 0x2B, -2)) || R_FAILED(threadStart(&worker))) {
-        prog->say("Could not start worker thread");
-        prog->done = true;
+static void handleInput(const In& in) {
+    if (g_page == P_SCAN) return;
+    if (g_page == P_INSTALL) {
+        if (in.down & K_B) g_confirmCancel = !g_confirmCancel;
+        if (g_confirmCancel && (in.down & K_A) && g_pr) {
+            g_pr->cancel = true;
+            g_confirmCancel = false;
+        }
         return;
     }
-    workerValid = true;
+    buildPage();
+    int nr = (int)g_rows.size(), nb = (int)g_btns.size();
+    bool listPage = (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS);
+    if (in.tap) {
+        for (int i = 0; i < nb; i++) {
+            SDL_Rect r = g_btns[i].r;
+            if (in.tx >= r.x && in.tx < r.x + r.w && in.ty >= r.y && in.ty < r.y + r.h) return doAct(g_btns[i].act);
+        }
+        if (listPage)
+            for (int i = 0; i < (int)g_rowRects.size() && i < nr; i++) {
+                SDL_Rect r = g_rowRects[i];
+                if (in.tx >= r.x && in.tx < r.x + r.w && in.ty >= r.y && in.ty < r.y + r.h && r.h > 0) {
+                    g_focus = i;
+                    rowFlip(i);
+                    return;
+                }
+            }
+    }
+    unsigned d = in.down;
+    if (d & K_B) {
+        if (g_page == P_HELLO) g_quit = true;
+        else if (g_page == P_DONE || g_page == P_ERROR) g_quit = true;
+        else if (g_page == P_FOUND) goBack();
+        else goBack();
+        return;
+    }
+    if (listPage) {
+        int total = nr + nb;
+        if (d & K_DOWN) g_focus = std::min(total - 1, g_focus + 1);
+        if (d & K_UP) g_focus = std::max(0, g_focus - 1);
+        if (g_focus >= nr) {
+            if (d & K_LEFT) g_focus = std::max(nr, g_focus - 1);
+            if (d & K_RIGHT) g_focus = std::min(total - 1, g_focus + 1);
+        }
+        if (d & K_PLUS) { for (auto& b : g_btns) if (b.primary) return doAct(b.act); }
+        if (d & K_A) {
+            if (g_focus < nr) rowFlip(g_focus);
+            else return doAct(g_btns[g_focus - nr].act);
+        }
+        return;
+    }
+    if (d & K_X) { for (auto& b : g_btns) if (!b.primary && b.act != A_BACK) return doAct(b.act); }
+    if (d & (K_A | K_PLUS)) { for (auto& b : g_btns) if (b.primary) return doAct(b.act); }
 }
 
-static void finishJob() {
-    joinWorker();
-    JobKind k = jobKind;
-    jobKind = J_NONE;
-    if (k == J_CHECK) {
+// ------------------------------------------------------------------ frame
+static void drawRow(int i, int x, int y, int w, int h, bool focus) {
+    const Row& r = g_rows[i];
+    fillRect(x, y, w, h, WHITE, focus ? 48 : 26);
+    if (focus) strokeRect(x, y, w, h, 2, WHITE, 230);
+    bool tg = rowIsToggle(i);
+    int tx = x + 20;
+    if (r.sub.empty()) text(fB, r.title, tx, y + (h - 30) / 2, WHITE, r.dis ? 160 : 255);
+    else {
+        text(fB, r.title, tx, y + 8, WHITE, r.dis ? 170 : 255);
+        text(fS, r.sub, tx, y + 8 + 31, DIM, r.dis ? 150 : 255);
+    }
+    if (tg) toggle(x + w - 20 - 52, y + (h - 26) / 2, rowOn(i), r.dis);
+    else if (!r.tag.empty()) {
+        int tw = textW(fS, r.tag);
+        text(fS, r.tag, x + w - 20, y + (h - 24) / 2, r.tagCol, 255, 2);
+        circle(x + w - 20 - tw - 16, y + h / 2, 5, r.tagCol);
+    }
+}
+
+static void drawStatus() {
+    int y = 676;
+    int x = MX;
+    struct H2 { const char *k, *l; };
+    std::vector<H2> hs;
+    if (g_page == P_INSTALL) hs = {{"B", "Cancel"}};
+    else if (g_page == P_HELLO) hs = {{"A", "Start"}, {"B", "Exit"}};
+    else if (g_page == P_SCAN) hs = {};
+    else if (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS) hs = {{"A", "Select"}, {"B", "Back"}, {"+", "Next"}};
+    else if (g_page == P_MODE) hs = {{"A", "Express"}, {"X", "Customize"}, {"B", "Back"}};
+    else if (g_page == P_DONE || g_page == P_ERROR) hs = {{"A", "Continue"}, {"B", "Exit"}};
+    else hs = {{"A", "Next"}, {"B", "Back"}};
+    for (auto& h : hs) {
+        chip(h.k, x, y);
+        x += 30;
+        x += text(fS, h.l, x, y - 1, DIM, 255, 0, false) + 28;
+    }
+    int bat = 87;
+#ifdef __SWITCH__
+    u32 b = 0;
+    if (R_SUCCEEDED(psmGetBatteryChargePercentage(&b))) bat = (int)b;
+#endif
+    char t[64];
+    snprintf(t, sizeof t, "%d%%", bat);
+    int rx = W - MX;
+    int tw = text(fS, t, rx, y - 1, DIM, 255, 2, false);
+    int bx = rx - tw - 34;
+    strokeRect(bx, y + 4, 24, 12, 2, DIM, 255);
+    fillRect(bx + 24, y + 7, 3, 6, DIM, 255, false);
+    fillRect(bx + 3, y + 7, std::max(1, (int)(18 * bat / 100.0)), 6, DIM, 255, false);
+    if (g_env.sdOk && g_page != P_HELLO) {
+        std::string s = fmtBytes(g_env.sdFree) + " free";
+        text(fS, s, bx - 26, y - 1, DIM, 255, 2, false);
+    }
+}
+
+static void drawFrame(double now) {
+    g_now = now;
+    // poll install
+    if (g_installing && g_pr && g_pr->done) {
+        if (g_th.joinable()) g_th.join();
+        g_installing = false;
+        goPage(g_pr->failed ? P_ERROR : P_DONE, false);
+        if (g_pr->failed) g_env = detectEnv();
+    }
+    if (g_page == P_SCAN && now - g_scanStart > 2.0) goPage(P_FOUND, false);
+
+    double ft = std::min(1.0, (now - g_pageT) / 0.28);
+    double e = 1 - pow(1 - ft, 3);
+    g_alpha = (float)e;
+    g_dx = (int)((1 - e) * 28);
+
+    SDL_SetRenderDrawColor(g_r, 0, 0, 0, 255);
+    SDL_RenderClear(g_r);
+    SDL_RenderCopy(g_r, texBG, nullptr, nullptr);
+    buildPage();
+
+    // hello: big emblem
+    if (g_page == P_HELLO) {
+        SDL_SetTextureAlphaMod(texBig, (Uint8)(255 * g_alpha));
+        SDL_Rect d{W - MX - 278 - 60 + g_dx, 130, 278, 416};
+        SDL_RenderCopy(g_r, texBig, nullptr, &d);
+    }
+    int titleF = (g_page == P_HELLO) ? 1 : 0;
+    if (titleF) text(fXL, title, MX, 150, WHITE);
+    else text(fL, title, MX, 82, WHITE);
+    int subY = titleF ? 280 : 150;
+    if (!sub.empty()) wrap(fM, sub, MX, subY, g_page == P_HELLO ? 560 : 900, DIM, 36);
+
+    // content
+    g_rowRects.assign(g_rows.size(), SDL_Rect{0, 0, 0, 0});
+    int cx = MX, cw = W - 2 * MX;
+    if (g_page == P_FOUND || g_page == P_MODE) {
+        int rh = g_page == P_FOUND ? 44 : 64, gap = 6, y = g_page == P_FOUND ? 218 : 280;
+        if (g_page == P_MODE) y = 300;
+        for (size_t i = 0; i < g_rows.size(); i++) {
+            drawRow((int)i, cx, y, cw, rh, false);
+            y += rh + gap;
+        }
+        if (g_page == P_MODE && g_env.online) {
+            const char* l[] = {"Atmosphère and Hekate (latest)", "14CFW boot menu with your logo", "Homebrew pack: save manager, file manager, FTP and more", "Backups of anything it replaces"};
+            int yy = 270;
+            (void)l;
+            (void)yy;
+            int by = 290;
+            for (int i = 0; i < 4; i++) {
+                circle(cx + 6, by + 14 + i * 38, 5, ACCENT);
+                text(fM, l[i], cx + 26, by + i * 38, WHITE);
+            }
+        }
+    } else if (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS) {
+        int rh = 64, pitch = 72, top = 212, vis = 5;
+        int nr = (int)g_rows.size();
+        if (g_focus < nr) {
+            if (g_focus < g_scroll) g_scroll = g_focus;
+            if (g_focus >= g_scroll + vis) g_scroll = g_focus - vis + 1;
+        }
+        SDL_Rect clip{0, top - 4, W, vis * pitch};
+        SDL_RenderSetClipRect(g_r, &clip);
+        for (int i = g_scroll; i < nr && i < g_scroll + vis; i++) {
+            int y = top + (i - g_scroll) * pitch;
+            drawRow(i, cx, y, cw, rh, g_focus == i);
+            g_rowRects[i] = SDL_Rect{cx, y, cw, rh};
+        }
+        SDL_RenderSetClipRect(g_r, nullptr);
+        if (nr > vis) {
+            int th = vis * pitch - 8, bh = th * vis / nr, by = top + (th - bh) * g_scroll / std::max(1, nr - vis);
+            fillRect(W - MX + 24, top, 4, th, WHITE, 40, false);
+            fillRect(W - MX + 24, by, 4, bh, WHITE, 200, false);
+        }
+    } else if (g_page == P_SCAN) {
+        spinner(MX + 60, 340, 44, now);
+        text(fM, "Checking your SD card and apps...", MX + 140, 322, WHITE);
+    } else if (g_page == P_INSTALL && g_pr) {
+        std::string st, dt;
+        std::vector<std::string> lg;
         {
-            std::lock_guard<std::mutex> g(prog->mu);
-            for (auto& kv : prog->latest)
-                for (auto& c : comps)
-                    if (c.id == kv.first) c.latest = kv.second;
+            std::lock_guard<std::mutex> l(g_pr->m);
+            st = g_pr->step;
+            dt = g_pr->detail;
+            lg = g_pr->log;
         }
-        screen = COMPS;
-        toast("Update check finished");
-    } else {
-        rescan();
-        screen = DONE;
-    }
-}
-
-static int selectedCount() {
-    int n = 0;
-    for (auto& c : comps)
-        if (c.selected) n++;
-    return n;
-}
-
-// ------------------------------------------------------------------ screens
-static void drawHome() {
-    fillRect(0, 0, W, H, C_BG);
-    
-    // Top panel with logo and title
-    fillRect(0, 0, W, 120, C_PANEL);
-    fillRect(0, 115, W, 2, C_ORG);
-    
-    drawLogo14(60, 60, 60);
-    text(fBig, "14 Custom Firmware", 130, 30, C_TEXT);
-    text(fSmall, "Nintendo Switch Installer", 130, 70, C_DIM);
-    
-    // Status cards in grid
-    int cx = 40, cy = 140, cw = 280, ch = 140, gap = 20;
-    
-    auto drawCard = [&](int x, int y, const std::string& title, const std::string& value, SDL_Color vc) {
-        fillRect(x, y, cw, ch, C_PANEL);
-        fillRect(x, y, cw, 2, C_ORG);
-        text(fSmall, title, x + 16, y + 12, C_DIM);
-        text(fBody, fit(fBody, value, cw - 32), x + 16, y + 50, vc);
-    };
-    
-    std::string amsV = env.amsRunning ? "v" + env.amsVer : (env.ams ? "Installed" : "Not found");
-    drawCard(cx, cy, "ATMOSPHERE", amsV, env.ams || env.amsRunning ? C_OK : C_TEXT);
-    
-    std::string hekV = env.hekate ? (env.hekateVer.empty() ? "Installed" : "v" + env.hekateVer) : "Not found";
-    drawCard(cx + cw + gap, cy, "HEKATE", hekV, env.hekate ? C_OK : C_TEXT);
-    
-    std::string sd = env.sdOk ? inst::humanSize(env.freeBytes) + " free" : "Unreadable";
-    drawCard(cx, cy + ch + gap, "SD CARD", sd, env.sdOk ? C_OK : C_ERR);
-    
-    std::string bat = env.battery >= 0 ? std::to_string(env.battery) + "%" : "Unknown";
-    bool lowBat = env.battery >= 0 && env.battery < 30 && !env.charging;
-    drawCard(cx + cw + gap, cy + ch + gap, "BATTERY", bat, lowBat ? C_ERR : C_OK);
-    
-    // Right side menu
-    int mx = 800, mh = 500;
-    text(fBody, "Setup Options", mx, 140, C_ORG);
-    
-    static const char* items[5] = {"Install Components", "Boot Menu Only", "Settings", "Refresh Status", "Exit"};
-    for (int i = 0; i < 5; i++) {
-        rcHome[i] = {mx, 180 + i * 90, 420, 75};
-        bool sel = i == homeSel;
-        fillRect(rcHome[i].x, rcHome[i].y, rcHome[i].w, rcHome[i].h, sel ? C_BORDER : C_PANEL);
-        if (sel) fillRect(rcHome[i].x, rcHome[i].y, 4, rcHome[i].h, C_ORG);
-        text(fBody, items[i], mx + 16, rcHome[i].y + 20, C_TEXT);
-    }
-    
-    text(fSmall, "Up/Down navigate • A select • + exit", W/2, 690, C_DIM, 1);
-}
-
-static void drawComps() {
-    fillRect(0, 0, W, H, C_BG);
-    
-    // Header
-    fillRect(0, 0, W, 100, C_PANEL);
-    fillRect(0, 95, W, 2, C_ORG);
-    drawLogo14(50, 50, 40);
-    text(fTitle, "Choose Components to Install", 110, 30, C_TEXT);
-    text(fSmall, "Select components, check for updates", 110, 70, C_DIM);
-    
-    // Component list
-    int n = (int)comps.size();
-    if (compSel < compTop) compTop = compSel;
-    if (compSel >= compTop + ROWS_VISIBLE) compTop = compSel - ROWS_VISIBLE + 1;
-    
-    for (int r = 0; r < ROWS_VISIBLE; r++) {
-        int i = compTop + r;
-        rcRows[r] = {0, 0, 0, 0};
-        if (i >= n) continue;
-        Component& c = comps[i];
-        int y = 120 + r * 60;
-        rcRows[r] = {40, y, W - 80, 55};
-        bool sel = i == compSel;
-        
-        fillRect(40, y, W - 80, 55, sel ? C_BORDER : C_PANEL);
-        if (sel) fillRect(40, y, 3, 55, C_ORG);
-        
-        checkbox(60, y + 14, 24, c.selected);
-        text(fBody, c.name, 100, y + 8, C_TEXT);
-        text(fSmall, fit(fSmall, c.desc, 600), 100, y + 32, C_DIM);
-        
-        if (c.installed) {
-            text(fSmall, "✓ Installed", W - 200, y + 16, C_OK);
+        spinner(MX + 60, 300, 44, now);
+        text(fB, st.empty() ? "Getting started" : st, MX + 140, 268, WHITE);
+        text(fS, dt, MX + 140, 306, DIM);
+        int bx = MX, by = 420, bw = cw;
+        fillRect(bx, by, bw, 6, WHITE, 40);
+        fillRect(bx, by, (int)(bw * g_pr->frac.load()), 6, WHITE, 255);
+        char t[16];
+        snprintf(t, sizeof t, "%d%%", (int)(g_pr->frac.load() * 100));
+        text(fS, t, bx + bw, by + 16, DIM, 255, 2);
+        int ly = 470;
+        for (int i = std::max(0, (int)lg.size() - 4); i < (int)lg.size(); i++) text(fS, lg[i], bx, ly += 26, DIM);
+        if (g_confirmCancel) {
+            fillRect(MX, 540, cw, 56, SDL_Color{0, 0, 0, 255}, 110);
+            text(fB, "Stop the install?  A = Yes, stop     B = Keep going", MX + 20, 552, WHITE);
         }
-    }
-    
-    // Buttons
-    rcBack = {40, 640, 140, 44};
-    rcCheck = {196, 640, 200, 44};
-    rcAll = {412, 640, 160, 44};
-    rcInstall = {W - 240, 640, 240, 44};
-    
-    button(rcBack, "B Back", false);
-    button(rcCheck, "X Check Updates", false);
-    button(rcAll, "Y Select All", false);
-    button(rcInstall, "+ Install (" + std::to_string(selectedCount()) + ")", true);
-}
-
-static void drawSettings() {
-    fillRect(0, 0, W, H, C_BG);
-    
-    // Header
-    fillRect(0, 0, W, 100, C_PANEL);
-    fillRect(0, 95, W, 2, C_ORG);
-    drawLogo14(50, 50, 40);
-    text(fTitle, "Installation Settings", 110, 30, C_TEXT);
-    
-    struct Row { const char* t; const char* s; bool on; };
-    Row rows[4] = {
-        {"Create backups", "Save overwritten files to switch/14CFW/backup", opts.backup},
-        {"Keep existing configs", "Never overwrite .ini, .json, .cfg files", opts.keepConfigs},
-        {"Install boot menu", "Add 14CFW Hekate menu with custom logo", opts.withBootMenu},
-        {"Replace main menu", "Use as primary menu (old menu backed up)", opts.replaceMenu},
-    };
-    
-    for (int i = 0; i < 4; i++) {
-        int y = 130 + i * 110;
-        rcSet[i] = {40, y, W - 80, 100};
-        bool sel = i == setSel;
-        
-        fillRect(40, y, W - 80, 100, sel ? C_BORDER : C_PANEL);
-        if (sel) fillRect(40, y, 3, 100, C_ORG);
-        
-        text(fBody, rows[i].t, 70, y + 14, C_TEXT);
-        text(fSmall, rows[i].s, 70, y + 48, C_DIM);
-        toggle(W - 100, y + 30, rows[i].on);
-    }
-    
-    rcBack = {40, 640, 140, 44};
-    button(rcBack, "B Back", false);
-    text(fSmall, "A to toggle • B to go back", W - 40, 654, C_DIM, 2);
-}
-
-static void drawConfirm() {
-    fillRect(0, 0, W, H, C_BG);
-    
-    // Header
-    fillRect(0, 0, W, 100, C_PANEL);
-    fillRect(0, 95, W, 2, C_ORG);
-    text(fTitle, "Ready to Install?", 40, 35, C_TEXT);
-    
-    // Summary panel
-    fillRect(60, 120, W - 120, 500, C_PANEL);
-    fillRect(60, 120, W - 120, 2, C_ORG);
-    
-    int y = 140;
-    text(fBody, "The following will be installed:", 80, y, C_ORG);
-    y += 40;
-    
-    int shown = 0;
-    for (auto& c : comps)
-        if (c.selected && !menuOnly) {
-            if (shown++ < 8) {
-                text(fSmall, "• " + c.name + (c.installed ? " (update)" : ""), 100, y, C_TEXT);
-                y += 28;
-            }
+    } else if (g_page == P_DONE && g_pr) {
+        std::vector<std::string> lg;
+        {
+            std::lock_guard<std::mutex> l(g_pr->m);
+            lg = g_pr->log;
         }
-    
-    if (opts.withBootMenu || menuOnly) {
-        text(fSmall, "• 14CFW Boot Menu", 100, y, C_ORG);
-        y += 28;
-    }
-    
-    y += 20;
-    text(fSmall, "✓ Your games, saves and emuMMC are protected", 80, y, C_OK);
-    y += 28;
-    text(fSmall, opts.backup ? "✓ Backups enabled" : "⚠ Backups disabled", 80, y, opts.backup ? C_OK : C_WARN);
-    y += 28;
-    text(fSmall, opts.keepConfigs ? "✓ Existing configs will be kept" : "⚠ Configs may be overwritten", 80, y, opts.keepConfigs ? C_OK : C_WARN);
-    
-    rcCancel = {W / 2 - 180, 640, 160, 44};
-    rcGo = {W / 2 + 20, 640, 160, 44};
-    button(rcCancel, "B Cancel", false);
-    button(rcGo, "A Install", true);
-}
-
-static void drawRun(Uint32 tick) {
-    fillRect(0, 0, W, H, C_BG);
-    
-    // Header
-    fillRect(0, 0, W, 100, C_PANEL);
-    fillRect(0, 95, W, 2, C_ORG);
-    text(fTitle, jobKind == J_CHECK ? "Checking Updates" : "Installing", 40, 35, C_TEXT);
-    
-    std::string step;
-    std::vector<std::string> lg;
-    float ov = 0, sub = 0;
-    if (prog) {
-        std::lock_guard<std::mutex> g(prog->mu);
-        step = prog->step;
-        lg = prog->log;
-        ov = prog->overall;
-        sub = prog->sub;
-    }
-    
-    // Progress section
-    fillRect(60, 120, W - 120, 100, C_PANEL);
-    fillRect(60, 120, W - 120, 2, C_ORG);
-    
-    std::string dots(1 + (tick / 400) % 3, '.');
-    text(fBody, (step.empty() ? std::string("Starting") : step) + dots, 80, 140, C_TEXT);
-    progressBar(80, 180, W - 160, 12, ov);
-    progressBar(80, 200, W - 160, 6, sub);
-    
-    // Log section
-    fillRect(60, 240, W - 120, 350, C_PANEL);
-    fillRect(60, 240, W - 120, 2, C_ORG);
-    
-    int maxl = 11;
-    int start = lg.size() > (size_t)maxl ? (int)lg.size() - maxl : 0;
-    for (int i = start; i < (int)lg.size(); i++) {
-        const std::string& s = lg[i];
-        SDL_Color col = s.find("FAILED") != std::string::npos ? C_ERR : C_TEXT;
-        text(fSmall, fit(fSmall, s, W - 160), 80, 260 + (i - start) * 28, col);
-    }
-    
-    rcCancel = {W / 2 - 160, 640, 320, 44};
-    button(rcCancel, prog && prog->cancel ? "Stopping..." : "B Cancel", false);
-    text(fSmall, "Do not power off your Switch", W / 2, 690, C_WARN, 1);
-}
-
-static void drawDone() {
-    fillRect(0, 0, W, H, C_BG);
-    
-    // Header
-    fillRect(0, 0, W, 100, C_PANEL);
-    fillRect(0, 95, W, 2, C_ORG);
-    text(fTitle, "Installation Complete", 40, 35, C_TEXT);
-    
-    bool bad = prog && (prog->failedHard || prog->failed > 0);
-    
-    // Result panel
-    fillRect(120, 130, W - 240, 470, C_PANEL);
-    fillRect(120, 130, W - 240, 2, bad ? C_ERR : C_ORG);
-    
-    // Status icon
-    int icon_y = 180;
-    if (bad) {
-        circle(W / 2, icon_y, 35, C_ERR);
-        line(W / 2 - 12, icon_y - 8, W / 2 + 12, icon_y + 8, C_BG, 4);
-    } else {
-        circle(W / 2, icon_y, 35, C_OK);
-        line(W / 2 - 15, icon_y, W / 2 - 5, icon_y + 12, C_BG, 4);
-        line(W / 2 - 5, icon_y + 12, W / 2 + 15, icon_y - 12, C_BG, 4);
-    }
-    
-    text(fTitle, bad ? "Completed with errors" : "All done!", W / 2, 260, C_TEXT, 1);
-    
-    std::vector<std::string> lg;
-    if (prog) {
-        std::lock_guard<std::mutex> g(prog->mu);
-        lg = prog->log;
-    }
-    
-    int y = 320;
-    int shown = 0;
-    for (int i = (int)lg.size() - 1; i >= 0 && shown < 4; i--) {
-        if (lg[i].find("FAILED") != std::string::npos) {
-            text(fSmall, "✗ " + fit(fSmall, lg[i], W - 280), 150, y, C_ERR);
-            y += 28;
-            shown++;
+        int y = 230;
+        for (auto& s : lg) {
+            bool warn = s.rfind("Warning", 0) == 0 || s.find("skipped") != std::string::npos;
+            circle(cx + 6, y + 14, 5, warn ? WARN : GOOD);
+            text(fM, s, cx + 26, y, WHITE);
+            y += 36;
+            if (y > 570) break;
         }
+    } else if (g_page == P_ERROR && g_pr) {
+        std::string er;
+        std::vector<std::string> lg;
+        {
+            std::lock_guard<std::mutex> l(g_pr->m);
+            er = g_pr->error;
+            lg = g_pr->log;
+        }
+        int y = wrap(fM, er, MX, 170, 900, WHITE, 36) + 20;
+        for (int i = std::max(0, (int)lg.size() - 5); i < (int)lg.size(); i++) y += 0 * text(fS, lg[i], MX, y, DIM) + 26;
     }
-    
-    text(fSmall, "Restart your Switch to apply changes", W / 2, 480, C_DIM, 1);
-    
-    rcGo = {W / 2 - 130, 640, 260, 44};
-    button(rcGo, "A Back to Menu", true);
-}
 
-// ------------------------------------------------------------------ actions
-static void homeAction(int i) {
-    if (i == 0) { menuOnly = false; screen = COMPS; }
-    else if (i == 1) { menuOnly = true; screen = CONFIRM; }
-    else if (i == 2) { screen = SETTINGS; }
-    else if (i == 3) { rescan(); toast("Status refreshed"); }
-}
-
-static bool wantExit = false;
-
-static void startInstallFlow() {
-    if (selectedCount() == 0 && !opts.withBootMenu) { toast("Nothing selected"); return; }
-    menuOnly = false;
-    screen = CONFIRM;
-}
-
-static void confirmGo() {
-    if (menuOnly) startJob(J_MENU);
-    else startJob(J_INSTALL);
-}
-
-static void toggleSetting(int i) {
-    if (i == 0) opts.backup = !opts.backup;
-    else if (i == 1) opts.keepConfigs = !opts.keepConfigs;
-    else if (i == 2) opts.withBootMenu = !opts.withBootMenu;
-    else if (i == 3) opts.replaceMenu = !opts.replaceMenu;
-    else return;
-    saveSettings();
-}
-
-static void selectAllToggle() {
-    bool any = false;
-    for (auto& c : comps)
-        if (!c.selected) any = true;
-    for (auto& c : comps) c.selected = any;
-}
-
-static void onTap(int x, int y) {
-    if (screen == HOME) {
-        for (int i = 0; i < 5; i++)
-            if (hit(rcHome[i], x, y)) { homeSel = i; if (i == 4) wantExit = true; else homeAction(i); }
-    } else if (screen == COMPS) {
-        if (hit(rcBack, x, y)) { screen = HOME; return; }
-        if (hit(rcCheck, x, y)) { startJob(J_CHECK); return; }
-        if (hit(rcAll, x, y)) { selectAllToggle(); return; }
-        if (hit(rcInstall, x, y)) { startInstallFlow(); return; }
-        for (int r = 0; r < ROWS_VISIBLE; r++)
-            if (hit(rcRows[r], x, y)) {
-                int i = compTop + r;
-                if (i < (int)comps.size()) { compSel = i; comps[i].selected = !comps[i].selected; }
-            }
-    } else if (screen == SETTINGS) {
-        if (hit(rcBack, x, y)) { screen = HOME; return; }
-        for (int i = 0; i < 4; i++)
-            if (hit(rcSet[i], x, y)) { setSel = i; toggleSetting(i); }
-    } else if (screen == CONFIRM) {
-        if (hit(rcCancel, x, y)) screen = HOME;
-        else if (hit(rcGo, x, y)) confirmGo();
-    } else if (screen == RUN) {
-        if (hit(rcCancel, x, y) && prog) prog->cancel = true;
-    } else if (screen == DONE) {
-        if (hit(rcGo, x, y)) screen = HOME;
+    // buttons
+    int nr = (int)g_rows.size();
+    bool listPage = (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS);
+    for (size_t i = 0; i < g_btns.size(); i++) {
+        const Btn& b = g_btns[i];
+        bool foc = listPage && g_focus == nr + (int)i;
+        if (b.primary) fillRect(b.r.x - g_dx, b.r.y, b.r.w, b.r.h, ACCENT, 255);
+        else fillRect(b.r.x - g_dx, b.r.y, b.r.w, b.r.h, WHITE, 40);
+        if (foc || (!listPage && b.primary)) strokeRect(b.r.x - g_dx, b.r.y, b.r.w, b.r.h, 2, WHITE, foc ? 255 : 150);
+        text(fB, b.label, b.r.x + b.r.w / 2 - g_dx, b.r.y + 9, WHITE, 255, 1);
     }
+    drawStatus();
+    SDL_RenderPresent(g_r);
 }
 
-// ------------------------------------------------------------------ main
-int main(int, char**) {
-    plInitialize(PlServiceType_User);
-    socketInitializeDefault();
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    inst::init();
-    SDL_Init(SDL_INIT_VIDEO);
+// ------------------------------------------------------------------ init
+static SDL_Texture* mkTex(const Rgba& im) {
+    SDL_Texture* t = SDL_CreateTexture(g_r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, im.w, im.h);
+    SDL_UpdateTexture(t, nullptr, im.px.data(), im.w * 4);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    return t;
+}
+static TTF_Font* openFont(int sz);
+
+static bool uiInit() {
+    g_win = SDL_CreateWindow("14CFW", 0, 0, W, H, SDL_WINDOW_SHOWN);
+    if (!g_win) return false;
+    g_r = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!g_r) g_r = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
+    if (!g_r) return false;
+    SDL_SetRenderDrawBlendMode(g_r, SDL_BLENDMODE_BLEND);
     TTF_Init();
-    SDL_Window* win = SDL_CreateWindow("14CFW", 0, 0, W, H, SDL_WINDOW_SHOWN);
-    R = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
+    fS = openFont(17);
+    fB = openFont(22);
+    fM = openFont(26);
+    fL = openFont(48);
+    fXL = openFont(92);
+    if (!fS || !fB || !fM || !fL || !fXL) return false;
+    // background: deep blue gradient with soft light
+    SDL_Surface* bg = SDL_CreateRGBSurfaceWithFormat(0, W, H, 32, SDL_PIXELFORMAT_RGBA32);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            float u = (x / (float)W + y / (float)H) / 2;
+            float r = 8 + (2 - 8) * u, g = 78 + (30 - 78) * u, b = 150 + (78 - 150) * u;
+            float dx = (x - W * 0.82f) / 700.f, dy = (y - H * 0.12f) / 520.f;
+            float glow = std::max(0.f, 1 - sqrtf(dx * dx + dy * dy));
+            glow = glow * glow * 46;
+            float dx2 = (x - W * 0.1f) / 500.f, dy2 = (y - H * 1.0f) / 380.f;
+            float g2 = std::max(0.f, 1 - sqrtf(dx2 * dx2 + dy2 * dy2));
+            g2 = g2 * g2 * 20;
+            Uint8* p = (Uint8*)bg->pixels + y * bg->pitch + x * 4;
+            p[0] = (Uint8)std::min(255.f, r + glow * 0.5f + g2 * 0.3f);
+            p[1] = (Uint8)std::min(255.f, g + glow * 0.9f + g2 * 0.6f);
+            p[2] = (Uint8)std::min(255.f, b + glow + g2);
+            p[3] = 255;
+        }
+    texBG = SDL_CreateTextureFromSurface(g_r, bg);
+    SDL_FreeSurface(bg);
+    // circle
+    SDL_Surface* cs = SDL_CreateRGBSurfaceWithFormat(0, 128, 128, 32, SDL_PIXELFORMAT_RGBA32);
+    for (int y = 0; y < 128; y++)
+        for (int x = 0; x < 128; x++) {
+            float d = sqrtf((x - 63.5f) * (x - 63.5f) + (y - 63.5f) * (y - 63.5f));
+            float a = std::max(0.f, std::min(1.f, 64.f - d));
+            Uint8* p = (Uint8*)cs->pixels + y * cs->pitch + x * 4;
+            p[0] = p[1] = p[2] = 255;
+            p[3] = (Uint8)(a * 255);
+        }
+    texCircle = SDL_CreateTextureFromSurface(g_r, cs);
+    SDL_SetTextureBlendMode(texCircle, SDL_BLENDMODE_BLEND);
+    SDL_FreeSurface(cs);
+    Rgba big, ic;
+    if (logoLoad(LOGO_S_BIG, big)) texBig = mkTex(big);
+    if (logoLoad(LOGO_S_ICON, ic)) texIcon = mkTex(ic);
+    if (!texBig) { Rgba e; e.w = e.h = 1; e.px = {0, 0, 0, 0}; texBig = mkTex(e); }
+    g_appOn.assign(hbApps().size(), 1);
+    return true;
+}
 
-    PlFontData fd;
-    if (R_SUCCEEDED(plGetSharedFontByType(&fd, PlSharedFontType_Standard))) {
-        auto open = [&](int sz) { return TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, sz); };
-        fSmall = open(17);
-        fBody = open(22);
-        fTitle = open(30);
-        fBig = open(44);
-    }
+static void uiShutdown() {
+    if (g_pr) g_pr->cancel = true;
+    if (g_th.joinable()) g_th.join();
+    for (auto& p : g_tc) SDL_DestroyTexture(p.second.t);
+    g_tc.clear();
+    if (texBG) SDL_DestroyTexture(texBG);
+    if (texBig) SDL_DestroyTexture(texBig);
+    if (texIcon) SDL_DestroyTexture(texIcon);
+    if (texCircle) SDL_DestroyTexture(texCircle);
+    if (g_r) SDL_DestroyRenderer(g_r);
+    if (g_win) SDL_DestroyWindow(g_win);
+    TTF_Quit();
+}
 
+#ifdef __SWITCH__
+static PlFontData g_fd;
+static TTF_Font* openFont(int sz) { return TTF_OpenFontRW(SDL_RWFromMem(g_fd.address, g_fd.size), 0, sz); }
+#else
+static TTF_Font* openFont(int sz) { return TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", sz); }
+#endif
+
+#ifndef CFW_NO_MAIN
+int main(int, char**) {
+#ifdef __SWITCH__
+    socketInitializeDefault();
+    plInitialize(PlServiceType_User);
+    psmInitialize();
+    plGetSharedFontByType(&g_fd, PlSharedFontType_Standard);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
     hidInitializeTouchScreen();
-
-    loadSettings();
-    inst::loadManifest(comps);
-    rescan();
-
-    if (fBody && fSmall && fTitle && fBig) {
-        bool wasDown = false, dragged = false;
-        int startY = 0, lastX = 0, lastY = 0;
-        while (appletMainLoop() && !wantExit) {
-            padUpdate(&pad);
-            u64 down = padGetButtonsDown(&pad);
-            SDL_Event e;
-            while (SDL_PollEvent(&e)) {}
-
-            HidTouchScreenState ts = {0};
-            hidGetTouchScreenStates(&ts, 1);
-            bool tapped = false;
-            if (ts.count > 0) {
-                int tx = (int)ts.touches[0].x, ty = (int)ts.touches[0].y;
-                if (!wasDown) { startY = ty; dragged = false; }
-                else if (std::abs(ty - startY) > 14) dragged = true;
-                lastX = tx;
-                lastY = ty;
-                wasDown = true;
-            } else if (wasDown) {
-                if (!dragged) tapped = true;
-                wasDown = false;
-            }
-            if (tapped) onTap(lastX, lastY);
-
-            if (jobKind != J_NONE && prog && prog->done) finishJob();
-
-            switch (screen) {
-            case HOME:
-                if (down & HidNpadButton_Up) homeSel = (homeSel + 4) % 5;
-                if (down & HidNpadButton_Down) homeSel = (homeSel + 1) % 5;
-                if (down & HidNpadButton_A) { if (homeSel == 4) wantExit = true; else homeAction(homeSel); }
-                if (down & HidNpadButton_Plus) wantExit = true;
-                break;
-            case COMPS: {
-                int n = (int)comps.size();
-                if (down & HidNpadButton_Up) compSel = (compSel + n - 1) % n;
-                if (down & HidNpadButton_Down) compSel = (compSel + 1) % n;
-                if ((down & HidNpadButton_A) && n) comps[compSel].selected = !comps[compSel].selected;
-                if (down & HidNpadButton_Y) selectAllToggle();
-                if (down & HidNpadButton_X) startJob(J_CHECK);
-                if (down & HidNpadButton_Plus) startInstallFlow();
-                if (down & HidNpadButton_B) screen = HOME;
-                break;
-            }
-            case SETTINGS:
-                if (down & HidNpadButton_Up) setSel = (setSel + 3) % 4;
-                if (down & HidNpadButton_Down) setSel = (setSel + 1) % 4;
-                if (down & HidNpadButton_A) toggleSetting(setSel);
-                if (down & HidNpadButton_B) screen = HOME;
-                break;
-            case CONFIRM:
-                if (down & HidNpadButton_A) confirmGo();
-                if (down & HidNpadButton_B) screen = HOME;
-                break;
-            case RUN:
-                if ((down & HidNpadButton_B) && prog) prog->cancel = true;
-                break;
-            case DONE:
-                if (down & (HidNpadButton_A | HidNpadButton_B)) screen = HOME;
-                if (down & HidNpadButton_Plus) wantExit = true;
-                break;
-            }
-
-            Uint32 tick = SDL_GetTicks();
-            switch (screen) {
-            case HOME: drawHome(); break;
-            case COMPS: drawComps(); break;
-            case SETTINGS: drawSettings(); break;
-            case CONFIRM: drawConfirm(); break;
-            case RUN: drawRun(tick); break;
-            case DONE: drawDone(); break;
-            }
-            if (SDL_GetTicks() < toastUntil) {
-                int w = textW(fSmall, toastMsg) + 44;
-                fillRect(W / 2 - w / 2, 590, w, 40, C_PANEL);
-                fillRect(W / 2 - w / 2, 590, w, 2, C_ORG);
-                text(fSmall, toastMsg, W / 2, 600, C_TEXT, 1);
-            }
-            SDL_RenderPresent(R);
+    SDL_Init(SDL_INIT_VIDEO);
+#else
+    SDL_Init(SDL_INIT_VIDEO);
+#endif
+    if (!uiInit()) return 1;
+    goPage(P_HELLO, false);
+    bool wasTouch = false;
+#ifdef __SWITCH__
+    while (appletMainLoop() && !g_quit) {
+        padUpdate(&pad);
+        u64 d = padGetButtonsDown(&pad);
+        In in;
+        if (d & HidNpadButton_A) in.down |= K_A;
+        if (d & HidNpadButton_B) in.down |= K_B;
+        if (d & HidNpadButton_X) in.down |= K_X;
+        if (d & HidNpadButton_Y) in.down |= K_Y;
+        if (d & (HidNpadButton_Up | HidNpadButton_StickLUp)) in.down |= K_UP;
+        if (d & (HidNpadButton_Down | HidNpadButton_StickLDown)) in.down |= K_DOWN;
+        if (d & (HidNpadButton_Left | HidNpadButton_StickLLeft)) in.down |= K_LEFT;
+        if (d & (HidNpadButton_Right | HidNpadButton_StickLRight)) in.down |= K_RIGHT;
+        if (d & HidNpadButton_Plus) in.down |= K_PLUS;
+        HidTouchScreenState ts = {0};
+        hidGetTouchScreenStates(&ts, 1);
+        if (ts.count > 0 && !wasTouch) {
+            in.tap = true;
+            in.tx = (int)ts.touches[0].x;
+            in.ty = (int)ts.touches[0].y;
+        }
+        wasTouch = ts.count > 0;
+        handleInput(in);
+        drawFrame(SDL_GetTicks() / 1000.0);
+    }
+    uiShutdown();
+    if (g_reboot) {
+        if (R_SUCCEEDED(spsmInitialize())) {
+            spsmShutdown(true);
+            spsmExit();
         }
     }
-
-    if (prog && jobKind != J_NONE) prog->cancel = true;
-    joinWorker();
-    delete prog;
-    for (auto& kv : tcache)
-        if (kv.second.t) SDL_DestroyTexture(kv.second.t);
-    inst::shutdown();
-    curl_global_cleanup();
-    socketExit();
-    if (R) SDL_DestroyRenderer(R);
-    if (win) SDL_DestroyWindow(win);
-    TTF_Quit();
-    SDL_Quit();
+    psmExit();
     plExit();
+    socketExit();
+#else
+    (void)wasTouch;
+    uiShutdown();
+#endif
     return 0;
 }
+#endif

@@ -1,735 +1,564 @@
 #include "installer.hpp"
-#include <switch.h>
-#include <curl/curl.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <fstream>
-#include <functional>
-#include <sstream>
-
-#define MINIZ_NO_TIME
-#define MINIZ_NO_ARCHIVE_WRITING_APIS
-#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
-#include "miniz.h"
+#include <curl/curl.h>
 #include "json.hpp"
+#include "logo.hpp"
+#include "miniz.h"
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 using json = nlohmann::json;
+std::string g_root = "sdmc:/";
 
-namespace inst {
+bool zinflate(const unsigned char* z, size_t zlen, unsigned char* out, size_t rawLen) {
+    mz_ulong n = (mz_ulong)rawLen;
+    return mz_uncompress(out, &n, z, (mz_ulong)zlen) == MZ_OK && n == rawLen;
+}
 
-static const char* HOME_DIR = "sdmc:/switch/14CFW";
-static const char* CACHE_DIR = "sdmc:/switch/14CFW/cache";
-static const char* BACKUP_DIR = "sdmc:/switch/14CFW/backup";
-static const char* CA_SD = "sdmc:/switch/14CFW/cacert.pem";
-static const char* MANIFEST_SD = "sdmc:/switch/14CFW/manifest.json";
+const std::vector<HbApp>& hbApps() {
+    static const std::vector<HbApp> v = {
+        {"checkpoint", "Checkpoint", "FlagBrew/Checkpoint", "checkpoint", "Back up and restore your game saves"},
+        {"jksv", "JKSV", "J-D-K/JKSV", "jksv", "Another save manager"},
+        {"nx-shell", "NX-Shell", "joel16/NX-Shell", "nx-shell", "File manager for your SD card"},
+        {"ftpd", "ftpd", "mtheall/ftpd", "ftpd", "FTP server to move files from your PC or phone"},
+        {"goldleaf", "Goldleaf", "XorTroll/Goldleaf", "goldleaf", "File browser and content manager"},
+        {"appstore", "Homebrew App Store", "fortheusers/hb-appstore", "appstore", "Get more homebrew with one tap"},
+        {"nxdumptool", "NXDumpTool", "DarkMatterCore/nxdumptool", "nxdumptool", "Dump your own cartridges and keys"},
+    };
+    return v;
+}
 
-static bool g_psm = false, g_romfs = false;
-
-// ------------------------------------------------------------------ small fs helpers
-static std::string P(const std::string& rel) { return "sdmc:/" + rel; }
+// ---------------------------------------------------------------- helpers
+static std::string sd(const std::string& rel) { return g_root + rel; }
 static bool exists(const std::string& p) {
     struct stat st;
     return stat(p.c_str(), &st) == 0;
 }
-static void mkdirs(const std::string& full) {  // creates every directory above the last '/'
-    size_t pos = 6;                             // skip "sdmc:/"
-    while ((pos = full.find('/', pos)) != std::string::npos) {
-        mkdir(full.substr(0, pos).c_str(), 0777);
-        pos++;
+static bool isDir(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+static std::string lower(std::string s) {
+    for (auto& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+static bool endsWith(const std::string& s, const std::string& e) {
+    return s.size() >= e.size() && s.compare(s.size() - e.size(), e.size(), e) == 0;
+}
+static bool startsWith(const std::string& s, const std::string& b) { return s.compare(0, b.size(), b) == 0; }
+
+static void mkdirs(const std::string& full) {  // full path, creates every missing level
+    size_t start = full.find(":/");
+    start = start == std::string::npos ? 0 : start + 2;
+    if (full.size() && full[0] == '/') start = 1;
+    for (size_t i = start; i <= full.size(); i++) {
+        if (i == full.size() || full[i] == '/') {
+            std::string d = full.substr(0, i);
+            if (!d.empty() && !isDir(d)) mkdir(d.c_str(), 0777);
+        }
     }
 }
-static bool copyFile(const std::string& src, const std::string& dst) {
-    FILE* in = fopen(src.c_str(), "rb");
+static void mkdirsFor(const std::string& file) {
+    size_t p = file.find_last_of('/');
+    if (p != std::string::npos) mkdirs(file.substr(0, p));
+}
+static bool copyFile(const std::string& a, const std::string& b) {
+    FILE* in = fopen(a.c_str(), "rb");
     if (!in) return false;
-    mkdirs(dst);
-    FILE* out = fopen(dst.c_str(), "wb");
-    if (!out) { fclose(in); return false; }
+    mkdirsFor(b);
+    FILE* out = fopen(b.c_str(), "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
     std::vector<char> buf(64 * 1024);
     size_t n;
     bool ok = true;
     while ((n = fread(buf.data(), 1, buf.size(), in)) > 0)
-        if (fwrite(buf.data(), 1, n, out) != n) { ok = false; break; }
+        if (fwrite(buf.data(), 1, n, out) != n) {
+            ok = false;
+            break;
+        }
     fclose(in);
     fclose(out);
     return ok;
 }
-static bool startsWith(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
-static bool endsWith(const std::string& s, const char* e) {
-    size_t n = strlen(e);
-    return s.size() >= n && s.compare(s.size() - n, n, e) == 0;
+static bool writeText(const std::string& path, const std::string& txt) {
+    mkdirsFor(path);
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(txt.data(), 1, txt.size(), f) == txt.size();
+    fclose(f);
+    if (!ok) return false;
+    remove(path.c_str());
+    return rename(tmp.c_str(), path.c_str()) == 0;
 }
-static std::string lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    return s;
-}
-static bool wild(const char* pat, const char* s) {  // '*' wildcard, case-insensitive
-    while (*pat) {
-        if (*pat == '*') {
-            while (*pat == '*') pat++;
-            if (!*pat) return true;
-            for (; *s; s++)
-                if (wild(pat, s)) return true;
-            return false;
-        }
-        if (tolower((unsigned char)*pat) != tolower((unsigned char)*s)) return false;
-        pat++;
-        s++;
-    }
-    return !*s;
+static bool replaceWith(const std::string& tmp, const std::string& path) {
+    remove(path.c_str());
+    return rename(tmp.c_str(), path.c_str()) == 0;
 }
 
-std::string humanSize(unsigned long long b) {
+std::string fmtBytes(unsigned long long b) {
     char t[32];
     if (b >= (1ull << 30)) snprintf(t, sizeof t, "%.1f GB", b / 1073741824.0);
-    else if (b >= (1ull << 20)) snprintf(t, sizeof t, "%.1f MB", b / 1048576.0);
-    else snprintf(t, sizeof t, "%.0f KB", b / 1024.0);
+    else if (b >= (1ull << 20)) snprintf(t, sizeof t, "%.0f MB", b / 1048576.0);
+    else snprintf(t, sizeof t, "%llu KB", b / 1024);
     return t;
 }
 
-// ------------------------------------------------------------------ safety rules
-// Paths we never write to. This is what keeps games, saves, emuMMC and keys safe.
-static bool neverTouch(const std::string& rel) {
-    static const char* pre[] = {"Nintendo/", "emuMMC/", "emummc/", "backup/", "switch/14CFW/", "switch/prod.keys",
-                                "switch/title.keys", "switch/dev.keys", "Backup/"};
-    for (auto p : pre)
-        if (startsWith(rel, p)) return true;
-    return false;
-}
-static bool unsafeRel(const std::string& rel) {
-    if (rel.empty() || rel[0] == '/' || rel.find("..") != std::string::npos || rel.find(':') != std::string::npos ||
-        rel.find('\\') != std::string::npos)
-        return true;
-    return false;
-}
-// Config-like files that already exist are kept when "keep my settings" is on.
-static bool isConfig(const std::string& rel) {
-    static const char* pre[] = {"atmosphere/config/", "atmosphere/hosts/", "bootloader/ini/", "config/"};
-    for (auto p : pre)
-        if (startsWith(rel, p)) return true;
-    if (rel == "bootloader/hekate_ipl.ini" || rel == "bootloader/patches.ini") return true;
-    std::string l = lower(rel);
-    return endsWith(l, ".ini") || endsWith(l, ".cfg") || endsWith(l, ".conf") || endsWith(l, ".config") ||
-           endsWith(l, ".json");
-}
-
-// ------------------------------------------------------------------ install context
-struct Ctx {
-    Options o;
-    Progress* p;
-    std::string bdir;
-    std::vector<std::string> extracted;
-};
-
-static bool backupFile(Ctx& c, const std::string& rel) {
-    if (!c.o.backup) return true;
-    std::string dst = c.bdir + "/" + rel;
-    if (!copyFile(P(rel), dst)) {
-        c.p->say("  ! could not back up " + rel);
-        return false;
+// ---------------------------------------------------------------- detection
+Env detectEnv() {
+    Env e;
+    struct statvfs sv;
+    if (statvfs(g_root.c_str(), &sv) == 0) {
+        e.sdOk = true;
+        e.sdFree = (unsigned long long)sv.f_bavail * sv.f_frsize;
+        e.sdTotal = (unsigned long long)sv.f_blocks * sv.f_frsize;
     }
-    c.p->backedUp++;
-    return true;
-}
-
-// Decide whether rel may be written. Returns false (and logs) when skipped.
-static bool allowWrite(Ctx& c, const std::string& rel) {
-    if (unsafeRel(rel)) { c.p->say("  ! unsafe path ignored: " + rel); c.p->skipped++; return false; }
-    if (neverTouch(rel)) { c.p->say("  = protected, left alone: " + rel); c.p->skipped++; return false; }
-    bool ex = exists(P(rel));
-    if (ex && c.o.keepConfigs && isConfig(rel)) {
-        c.p->say("  = kept your existing " + rel);
-        c.p->skipped++;
-        return false;
-    }
-    if (ex && !backupFile(c, rel)) {
-        c.p->say("  ! backup failed, not overwriting " + rel);
-        c.p->skipped++;
-        return false;
-    }
-    return true;
-}
-
-static bool commitTmp(const std::string& tmp, const std::string& dst) {
-    remove(dst.c_str());
-    return rename(tmp.c_str(), dst.c_str()) == 0;
-}
-
-struct WriteCtx { FILE* f; bool ok; };
-static size_t zipWrite(void* op, mz_uint64, const void* buf, size_t n) {
-    WriteCtx* w = (WriteCtx*)op;
-    if (!w->ok) return 0;
-    if (fwrite(buf, 1, n, w->f) != n) { w->ok = false; return 0; }
-    return n;
-}
-
-static bool extractZip(Ctx& c, const std::string& zipPath, std::string& err) {
-    mz_zip_archive za;
-    memset(&za, 0, sizeof za);
-    if (!mz_zip_reader_init_file(&za, zipPath.c_str(), 0)) { err = "bad zip file"; return false; }
-    mz_uint n = mz_zip_reader_get_num_files(&za);
-    bool ok = true;
-    for (mz_uint i = 0; i < n && ok; i++) {
-        if (c.p->cancel) { err = "cancelled"; ok = false; break; }
-        mz_zip_archive_file_stat st;
-        if (!mz_zip_reader_file_stat(&za, i, &st)) continue;
-        std::string rel = st.m_filename;
-        c.p->sub = (float)i / (float)(n ? n : 1);
-        if (st.m_is_directory) {
-            if (!unsafeRel(rel) && !neverTouch(rel)) {
-                std::string d = P(rel);
-                if (!d.empty() && d.back() != '/') d += "/";
-                mkdirs(d + "x");
+    e.online = true;
+    e.fw = "";
+#ifdef __SWITCH__
+    {
+        if (R_SUCCEEDED(nifmInitialize(NifmServiceType_User))) {
+            NifmInternetConnectionType t;
+            u32 s;
+            NifmInternetConnectionStatus st;
+            e.online = R_SUCCEEDED(nifmGetInternetConnectionStatus(&t, &s, &st)) && st == NifmInternetConnectionStatus_Connected;
+            nifmExit();
+        } else
+            e.online = false;
+        if (R_SUCCEEDED(setsysInitialize())) {
+            SetSysFirmwareVersion fv;
+            if (R_SUCCEEDED(setsysGetFirmwareVersion(&fv))) e.fw = fv.display_version;
+            setsysExit();
+        }
+        if (R_SUCCEEDED(splInitialize())) {
+            u64 v = 0;
+            if (R_SUCCEEDED(splGetConfig((SplConfigItem)65000, &v))) {
+                e.amsRunning = true;
+                char t[32];
+                snprintf(t, sizeof t, "%d.%d.%d", (int)((v >> 56) & 0xFF), (int)((v >> 48) & 0xFF), (int)((v >> 40) & 0xFF));
+                e.amsVer = t;
             }
-            continue;
+            splExit();
         }
-        if (!allowWrite(c, rel)) continue;
-        std::string dst = P(rel), tmp = dst + ".14tmp";
-        mkdirs(dst);
-        FILE* f = fopen(tmp.c_str(), "wb");
-        if (!f) { c.p->say("  ! cannot write " + rel); c.p->failed++; continue; }
-        WriteCtx w{f, true};
-        mz_bool r = mz_zip_reader_extract_to_callback(&za, i, zipWrite, &w, 0);
-        fclose(f);
-        if (!r || !w.ok || !commitTmp(tmp, dst)) {
-            remove(tmp.c_str());
-            c.p->say("  ! failed: " + rel);
-            c.p->failed++;
-            ok = false;
-            err = "write failed (SD full?)";
-            break;
-        }
-        c.extracted.push_back(rel);
-        c.p->ok++;
     }
-    mz_zip_reader_end(&za);
-    return ok;
+#endif
+    e.amsFiles = exists(sd("atmosphere/package3")) || isDir(sd("atmosphere/contents"));
+    e.hekate = exists(sd("bootloader/update.bin")) || exists(sd("bootloader/hekate_ipl.ini")) || isDir(sd("bootloader/sys"));
+    e.emummc = isDir(sd("emuMMC"));
+    e.nintendo = isDir(sd("Nintendo"));
+    e.bootMenu = exists(sd("bootloader/res/14cfw_logo.bmp"));
+    auto scan = [&](const std::string& dirRel, int depth, auto&& self) -> void {
+        DIR* d = opendir(sd(dirRel).c_str());
+        if (!d) return;
+        while (dirent* en = readdir(d)) {
+            std::string n = en->d_name;
+            if (n == "." || n == "..") continue;
+            std::string rel = dirRel + "/" + n;
+            if (endsWith(lower(n), ".nro")) e.nros.push_back(lower(n.substr(0, n.size() - 4)));
+            else if (depth < 1 && isDir(sd(rel))) self(rel, depth + 1, self);
+        }
+        closedir(d);
+    };
+    scan("switch", 0, scan);
+    return e;
 }
 
-static bool placeFile(Ctx& c, const std::string& srcPath, const std::string& rel, std::string& err) {
-    if (!allowWrite(c, rel)) return true;  // skipped by rule = not an error
-    std::string dst = P(rel), tmp = dst + ".14tmp";
-    if (!copyFile(srcPath, tmp) || !commitTmp(tmp, dst)) {
-        remove(tmp.c_str());
-        err = "could not write " + rel;
-        c.p->failed++;
-        return false;
-    }
-    c.p->ok++;
-    return true;
+bool appPresent(const Env& e, const HbApp& a) {
+    for (auto& n : e.nros)
+        if (n.find(a.id) != std::string::npos || n.find(lower(a.hint)) != std::string::npos) return true;
+    return false;
 }
 
-// ------------------------------------------------------------------ network
-struct DL {
-    FILE* f = nullptr;
-    std::string* mem = nullptr;
-    Progress* p = nullptr;
-};
-static size_t dlWrite(char* d, size_t s, size_t n, void* u) {
-    DL* x = (DL*)u;
-    if (x->f) return fwrite(d, 1, s * n, x->f);
-    if (x->mem) x->mem->append(d, s * n);
+// ---------------------------------------------------------------- network
+static size_t wrStr(void* p, size_t s, size_t n, void* u) {
+    ((std::string*)u)->append((char*)p, s * n);
     return s * n;
 }
-static int dlProgress(void* u, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t) {
-    DL* x = (DL*)u;
-    if (x->p) {
-        if (x->p->cancel) return 1;
-        if (total > 0) x->p->sub = (float)now / (float)total;
-    }
+static size_t wrFile(void* p, size_t s, size_t n, void* u) { return fwrite(p, s, n, (FILE*)u); }
+
+struct DlCtx {
+    Progress* pr;
+    float base, span;
+};
+static int xfer(void* u, curl_off_t tot, curl_off_t now, curl_off_t, curl_off_t) {
+    DlCtx* c = (DlCtx*)u;
+    if (c->pr->cancel) return 1;
+    if (tot > 0) c->pr->frac = c->base + c->span * (float)((double)now / (double)tot);
     return 0;
 }
-
-static bool http(const std::string& url, std::string* mem, FILE* f, Progress* p, std::string& err, bool api) {
-    CURL* c = curl_easy_init();
-    if (!c) { err = "curl init failed"; return false; }
-    DL dl;
-    dl.f = f;
-    dl.mem = mem;
-    dl.p = p;
-    curl_slist* h = nullptr;
-    if (api) h = curl_slist_append(h, "Accept: application/vnd.github+json");
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "14CFW/0.1");
-    if (h) curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+static void curlCommon(CURL* c) {
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "14CFW/1.1");
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);  // the Switch has no CA bundle for libcurl
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 40L);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, dlWrite);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &dl);
-    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, dlProgress);
-    curl_easy_setopt(c, CURLOPT_XFERINFODATA, &dl);
-    if (exists(CA_SD)) curl_easy_setopt(c, CURLOPT_CAINFO, CA_SD);
-    else {
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
-    }
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 30L);
+}
+static bool httpGet(const std::string& url, std::string& out) {
+    CURL* c = curl_easy_init();
+    if (!c) return false;
+    curlCommon(c);
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wrStr);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
     CURLcode rc = curl_easy_perform(c);
     long code = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    if (h) curl_slist_free_all(h);
     curl_easy_cleanup(c);
-    if (rc == CURLE_ABORTED_BY_CALLBACK) { err = "cancelled"; return false; }
-    if (rc != CURLE_OK) { err = std::string("network: ") + curl_easy_strerror(rc); return false; }
-    if (code != 200) { err = "HTTP " + std::to_string(code); return false; }
-    return true;
+    return rc == CURLE_OK && code == 200;
 }
-
-struct Asset { std::string name, url; unsigned long long size = 0; };
-struct Release { std::string tag; std::vector<Asset> assets; };
-
-static bool fetchRelease(const std::string& repo, Release& out, std::string& err) {
-    std::string body;
-    if (!http("https://api.github.com/repos/" + repo + "/releases/latest", &body, nullptr, nullptr, err, true)) return false;
-    json j = json::parse(body, nullptr, false);
-    if (j.is_discarded() || !j.is_object() || !j.contains("assets") || !j["assets"].is_array()) { err = "bad GitHub reply"; return false; }
-    out.tag = j.value("tag_name", "");
-    for (auto& a : j["assets"]) {
-        Asset x;
-        x.name = a.value("name", "");
-        x.url = a.value("browser_download_url", "");
-        x.size = a.value("size", 0ull);
-        if (!x.name.empty() && !x.url.empty()) out.assets.push_back(x);
-    }
-    return true;
-}
-
-static const Asset* pickAsset(const Release& r, const std::string& pat, const std::string& skip) {
-    for (auto& a : r.assets) {
-        if (!wild(pat.c_str(), a.name.c_str())) continue;
-        if (!skip.empty() && wild(skip.c_str(), a.name.c_str())) continue;
-        return &a;
-    }
-    return nullptr;
-}
-
-static bool download(Progress& p, const std::string& url, const std::string& path, std::string& err) {
-    mkdirs(path);
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) { err = "cannot create cache file"; return false; }
-    p.sub = 0;
-    bool ok = http(url, nullptr, f, &p, err, false);
-    fclose(f);
-    if (!ok) remove(path.c_str());
-    return ok;
-}
-
-// ------------------------------------------------------------------ manifest
-static const char* DEFAULT_MANIFEST = R"JSON({"components":[
-{"id":"ams","name":"Atmosphère","desc":"The custom firmware itself (with hbmenu)","repo":"Atmosphere-NX/Atmosphere","asset":"atmosphere-*.zip","skip":"*WITHOUT_MESOSPHERE*","type":"zip","detect":["atmosphere/package3"],"core":true,"default":true,
- "extras":[{"asset":"fusee.bin","to":"bootloader/payloads/fusee.bin"}]},
-{"id":"hekate","name":"Hekate + Nyx","desc":"Bootloader and boot menu (also set as reboot payload)","repo":"CTCaer/hekate","asset":"hekate_ctcaer_*.zip","type":"zip","detect":["bootloader/update.bin"],"core":true,"default":true,
- "post":{"pattern":"hekate_ctcaer_*.bin","to":"atmosphere/reboot_payload.bin"}},
-{"id":"ovl","name":"Tesla overlay loader","desc":"nx-ovlloader: overlays on top of games","repo":"WerWolv/nx-ovlloader","asset":"nx-ovlloader*.zip","type":"zip","detect":["atmosphere/contents/420000000007E51A/exefs.nsp"],"default":false},
-{"id":"tesla","name":"Tesla menu","desc":"Overlay menu (needs the loader above)","repo":"WerWolv/Tesla-Menu","asset":"ovlmenu.zip","type":"zip","detect":["switch/.overlays/ovlmenu.ovl"],"default":false},
-{"id":"checkpoint","name":"Checkpoint","desc":"Save backup and restore","repo":"FlagBrew/Checkpoint","asset":"Checkpoint*.nro","type":"file","to":"switch/Checkpoint/Checkpoint.nro","detect":["switch/Checkpoint/Checkpoint.nro"],"default":true},
-{"id":"jksv","name":"JKSV","desc":"Save manager","repo":"J-D-K/JKSV","asset":"JKSV*.nro","type":"file","to":"switch/JKSV/JKSV.nro","detect":["switch/JKSV/JKSV.nro"],"default":false},
-{"id":"nxshell","name":"NX-Shell","desc":"File manager","repo":"joel16/NX-Shell","asset":"NX-Shell*.nro","type":"file","to":"switch/NX-Shell/NX-Shell.nro","detect":["switch/NX-Shell/NX-Shell.nro"],"default":true},
-{"id":"ftpd","name":"ftpd","desc":"FTP server for your SD card","repo":"mtheall/ftpd","asset":"ftpd*.nro","type":"file","to":"switch/ftpd/ftpd.nro","detect":["switch/ftpd/ftpd.nro"],"default":false},
-{"id":"appstore","name":"Homebrew App Store","desc":"Browse and install homebrew","repo":"fortheusers/hb-appstore","asset":"appstore.nro","type":"file","to":"switch/appstore/appstore.nro","detect":["switch/appstore/appstore.nro"],"default":true}
-]})JSON";
-
-static void parseManifest(const std::string& text, std::vector<Component>& out) {
-    json j = json::parse(text, nullptr, false);
-    if (j.is_discarded() || !j.is_object() || !j.contains("components") || !j["components"].is_array()) return;
-    for (auto& e : j["components"]) {
-        if (!e.is_object()) continue;
-        Component c;
-        c.id = e.value("id", "");
-        c.name = e.value("name", c.id);
-        c.desc = e.value("desc", "");
-        c.repo = e.value("repo", "");
-        c.url = e.value("url", "");
-        c.asset = e.value("asset", "");
-        c.skip = e.value("skip", "");
-        c.type = e.value("type", "zip");
-        c.to = e.value("to", "");
-        c.core = e.value("core", false);
-        c.defSel = e.value("default", false);
-        if (e.contains("detect") && e["detect"].is_array())
-            for (auto& d : e["detect"])
-                if (d.is_string()) c.detect.push_back(d.get<std::string>());
-        if (e.contains("extras") && e["extras"].is_array())
-            for (auto& x : e["extras"])
-                if (x.is_object()) c.extras.push_back({x.value("asset", ""), x.value("to", "")});
-        if (e.contains("post") && e["post"].is_object()) {
-            c.postPattern = e["post"].value("pattern", "");
-            c.postTo = e["post"].value("to", "");
-        }
-        if (c.id.empty() || (c.repo.empty() && c.url.empty())) continue;
-        out.push_back(c);
-    }
-}
-
-void loadManifest(std::vector<Component>& out) {
-    out.clear();
-    std::ifstream in(MANIFEST_SD);
-    if (in) {
-        std::stringstream ss;
-        ss << in.rdbuf();
-        parseManifest(ss.str(), out);
-    }
-    if (out.empty()) parseManifest(DEFAULT_MANIFEST, out);
-    for (auto& c : out) c.selected = c.defSel;
-}
-
-// ------------------------------------------------------------------ system info
-void init() {
-    mkdir("sdmc:/switch", 0777);
-    mkdir(HOME_DIR, 0777);
-    mkdir(CACHE_DIR, 0777);
-    mkdir(BACKUP_DIR, 0777);
-    if (R_SUCCEEDED(psmInitialize())) g_psm = true;
-    if (R_SUCCEEDED(romfsInit())) {
-        g_romfs = true;
-        if (!exists(CA_SD)) copyFile("romfs:/cacert.pem", CA_SD);
-    }
-}
-void shutdown() {
-    if (g_psm) psmExit();
-    if (g_romfs) romfsExit();
-}
-
-static std::string findHekateVersion() {
-    DIR* d = opendir("sdmc:/");
-    if (!d) return "";
-    std::string best;
-    while (dirent* e = readdir(d)) {
-        std::string n = e->d_name;
-        if (startsWith(n, "hekate_ctcaer_") && endsWith(n, ".bin")) {
-            std::string v = n.substr(14, n.size() - 14 - 4);
-            if (v > best) best = v;
-        }
-    }
-    closedir(d);
-    return best;
-}
-
-void scan(std::vector<Component>& comps, Env& env) {
-    for (auto& c : comps) {
-        c.installed = !c.detect.empty();
-        for (auto& d : c.detect)
-            if (!exists(P(d))) c.installed = false;
-    }
-    env.ams = exists(P("atmosphere/package3")) || exists(P("atmosphere/contents"));
-    env.hekate = exists(P("bootloader/update.bin"));
-    env.hekateVer = findHekateVersion();
-    env.nintendo = exists(P("Nintendo"));
-    env.emummc = exists(P("emuMMC")) || exists(P("emummc"));
-    env.tlsOk = exists(CA_SD);
-    struct statvfs sv;
-    env.sdOk = statvfs("sdmc:/", &sv) == 0;
-    if (env.sdOk) {
-        env.freeBytes = (unsigned long long)sv.f_bavail * sv.f_frsize;
-        env.totalBytes = (unsigned long long)sv.f_blocks * sv.f_frsize;
-    }
-    env.amsRunning = false;
-    env.amsVer.clear();
-    if (R_SUCCEEDED(splInitialize())) {
-        u64 cfg = 0;
-        if (R_SUCCEEDED(splGetConfig((SplConfigItem)65000, &cfg)) && cfg) {
-            env.amsRunning = true;
-            char v[32];
-            snprintf(v, sizeof v, "%u.%u.%u", (unsigned)((cfg >> 56) & 0xFF), (unsigned)((cfg >> 48) & 0xFF), (unsigned)((cfg >> 40) & 0xFF));
-            env.amsVer = v;
-        }
-        splExit();
-    }
-    if (g_psm) {
-        u32 pct = 0;
-        PsmChargerType ct = PsmChargerType_Unconnected;
-        if (R_SUCCEEDED(psmGetBatteryChargePercentage(&pct))) env.battery = (int)pct;
-        if (R_SUCCEEDED(psmGetChargerType(&ct))) env.charging = ct != PsmChargerType_Unconnected;
-    }
-}
-
-// ------------------------------------------------------------------ update check
-void checkUpdates(std::vector<Component> comps, Progress& p) {
-    int n = (int)comps.size(), i = 0;
-    for (auto& c : comps) {
-        p.overall = (float)i++ / (float)(n ? n : 1);
-        p.setStep("Checking " + c.name);
-        if (c.repo.empty()) continue;
-        Release r;
-        std::string err;
-        if (fetchRelease(c.repo, r, err)) {
-            std::lock_guard<std::mutex> g(p.mu);
-            p.latest.push_back({c.id, r.tag});
-        } else {
-            p.say(c.name + ": " + err);
-        }
-        if (p.cancel) break;
-    }
-    p.overall = 1;
-    p.done = true;
-}
-
-// ------------------------------------------------------------------ BMP drawing (boot logo and icon)
-static float sdBox(float px, float py, float cx, float cy, float hw, float hh, float r) {
-    float qx = std::fabs(px - cx) - (hw - r), qy = std::fabs(py - cy) - (hh - r);
-    float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
-    float inside = std::min(std::max(qx, qy), 0.f);
-    return std::sqrt(ox * ox + oy * oy) + inside - r;
-}
-static float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
-
-static void logoPixel(int x, int y, int w, int h, float k, float cx, float cy, unsigned char* bgra) {
-    float v = (float)y / (float)h;
-    float r = 11 + 12 * v, g = 14 + 14 * v, b = 23 + 30 * v;
-    float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
-    // ring
-    float dx = fx - cx, dy = fy - cy;
-    float dist = std::sqrt(dx * dx + dy * dy);
-    float rr = 190.f * k, th = 14.f * k;
-    float a = clamp01(0.5f - (std::fabs(dist - rr) - th * 0.5f));
-    if (a > 0) {
-        float t = 0.5f + 0.5f * std::sin(std::atan2(dy, dx) * 1.0f + 0.6f);
-        float cr = 25 + (255 - 25) * t, cg = 230 + (122 - 230) * t, cb = 255 + (69 - 255) * t;
-        r += (cr - r) * a; g += (cg - g) * a; b += (cb - b) * a;
-    }
-    float a2 = clamp01(0.5f - (std::fabs(dist - 150.f * k) - 2.f * k)) * 0.45f;
-    if (a2 > 0) { r += (255 - r) * a2; g += (255 - g) * a2; b += (255 - b) * a2; }
-    // "14" in seven-segment style
-    float bw = 100.f * k, bh = 170.f * k, t = 26.f * k;
-    struct D { float x0; int segs; };
-    D ds[2] = {{cx - 128.f * k, 0b0000110}, {cx + 28.f * k, 0b1100110}};  // 1: b,c   4: b,c,f,g
-    for (auto& d : ds) {
-        float y0 = cy - bh / 2;
-        float mid = y0 + bh / 2;
-        float segd = 1e9f;
-        auto seg = [&](float sx, float sy, float sw, float sh) {
-            float s = sdBox(fx, fy, sx + sw / 2, sy + sh / 2, sw / 2, sh / 2, t * 0.35f);
-            if (s < segd) segd = s;
-        };
-        if (d.segs & 0b0000010) seg(d.x0 + bw - t, y0, t, bh / 2 + t / 2);        // b
-        if (d.segs & 0b0000100) seg(d.x0 + bw - t, mid - t / 2, t, bh / 2 + t / 2);  // c
-        if (d.segs & 0b0100000) seg(d.x0, y0, t, bh / 2 + t / 2);                  // f
-        if (d.segs & 0b1000000) seg(d.x0, mid - t / 2, bw, t);                     // g
-        float sa = clamp01(0.5f - segd);
-        if (sa > 0) { r += (240 - r) * sa; g += (244 - g) * sa; b += (255 - b) * sa; }
-    }
-    // underline bar
-    float bd = sdBox(fx, fy, cx, cy + 270.f * k, 150.f * k, 3.f * k, 3.f * k);
-    float ba = clamp01(0.5f - bd);
-    if (ba > 0) {
-        float t2 = clamp01((fx - (cx - 150.f * k)) / (300.f * k));
-        float cr = 25 + (255 - 25) * t2, cg = 230 + (122 - 230) * t2, cb = 255 + (69 - 255) * t2;
-        r += (cr - r) * ba; g += (cg - g) * ba; b += (cb - b) * ba;
-    }
-    bgra[0] = (unsigned char)std::min(255.f, b);
-    bgra[1] = (unsigned char)std::min(255.f, g);
-    bgra[2] = (unsigned char)std::min(255.f, r);
-    bgra[3] = 255;
-}
-
-static bool writeLogoBmp(const std::string& path, int w, int h, float k, float cx, float cy) {
-    mkdirs(path);
+static bool httpFile(const std::string& url, const std::string& path, Progress& pr, float base, float span) {
+    mkdirsFor(path);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) return false;
-    unsigned int imgSize = (unsigned)(w * h * 4), fileSize = 54 + imgSize;
-    unsigned char hd[54] = {0};
-    hd[0] = 'B'; hd[1] = 'M';
-    memcpy(hd + 2, &fileSize, 4);
-    unsigned int off = 54, dib = 40;
-    memcpy(hd + 10, &off, 4);
-    memcpy(hd + 14, &dib, 4);
-    int iw = w, ih = h;
-    memcpy(hd + 18, &iw, 4);
-    memcpy(hd + 22, &ih, 4);
-    unsigned short planes = 1, bpp = 32;
-    memcpy(hd + 26, &planes, 2);
-    memcpy(hd + 28, &bpp, 2);
-    memcpy(hd + 34, &imgSize, 4);
-    bool ok = fwrite(hd, 1, 54, f) == 54;
-    std::vector<unsigned char> row((size_t)w * 4);
-    for (int y = h - 1; y >= 0 && ok; y--) {  // bottom-up
-        for (int x = 0; x < w; x++) logoPixel(x, y, w, h, k, cx, cy, &row[(size_t)x * 4]);
-        ok = fwrite(row.data(), 1, row.size(), f) == row.size();
+    CURL* c = curl_easy_init();
+    if (!c) {
+        fclose(f);
+        return false;
     }
+    DlCtx ctx{&pr, base, span};
+    curlCommon(c);
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wrFile);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, f);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA, &ctx);
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(c);
     fclose(f);
+    if (rc != CURLE_OK || code != 200) {
+        remove(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+struct Asset {
+    std::string name, url, tag;
+};
+// all assets of the latest release
+static bool latestAssets(const std::string& repo, std::vector<Asset>& out, std::string& tag) {
+    std::string body;
+    if (!httpGet("https://api.github.com/repos/" + repo + "/releases/latest", body)) return false;
+    try {
+        json j = json::parse(body);
+        tag = j.value("tag_name", "");
+        for (auto& a : j["assets"]) out.push_back({a.value("name", ""), a.value("browser_download_url", ""), tag});
+    } catch (...) {
+        return false;
+    }
+    return !out.empty();
+}
+
+// ---------------------------------------------------------------- safety rules
+// Never written, whatever a zip contains: games, saves, emuMMC and keys.
+static bool isProtected(const std::string& relRaw) {
+    std::string r = lower(relRaw);
+    if (startsWith(r, "nintendo/") || startsWith(r, "emummc/") || startsWith(r, "switch/14cfw/")) return true;
+    if (endsWith(r, ".keys")) return true;
+    return false;
+}
+// Existing user settings are kept: only written when the file isn't there yet.
+static bool keepExisting(const std::string& relRaw) {
+    std::string r = lower(relRaw);
+    return startsWith(r, "atmosphere/config/") || startsWith(r, "atmosphere/hosts/") || r == "bootloader/hekate_ipl.ini" ||
+           startsWith(r, "bootloader/ini/") || r == "atmosphere/system_settings.ini";
+}
+static bool needsBackup(const std::string& relRaw) {
+    std::string r = lower(relRaw);
+    return r == "bootloader/hekate_ipl.ini" || r == "bootloader/bootlogo.bmp" || r == "atmosphere/reboot_payload.bin" ||
+           r == "bootloader/update.bin" || r == "atmosphere/package3";
+}
+
+struct Ctx {
+    const Plan* plan;
+    Progress* pr;
+    std::string stamp;
+    int backups = 0;
+};
+static void backupFile(Ctx& c, const std::string& rel) {
+    if (!c.plan->backup || !exists(sd(rel))) return;
+    if (copyFile(sd(rel), sd("switch/14CFW/backup/" + c.stamp + "/" + rel))) c.backups++;
+}
+
+// Extract a zip to the SD root following the safety rules. skipRoot: ignore root-level files matching.
+static int extractZip(Ctx& c, const std::string& zipPath, bool skipRootBins) {
+    mz_zip_archive z;
+    memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zipPath.c_str(), 0)) return -1;
+    int n = (int)mz_zip_reader_get_num_files(&z), done = 0;
+    for (int i = 0; i < n; i++) {
+        if (c.pr->cancel) break;
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&z, i, &st)) continue;
+        std::string rel = st.m_filename;
+        if (rel.empty() || rel.find("..") != std::string::npos) continue;
+        if (mz_zip_reader_is_file_a_directory(&z, i)) {
+            if (!isProtected(rel)) mkdirs(sd(rel));
+            continue;
+        }
+        if (isProtected(rel)) continue;
+        if (skipRootBins && rel.find('/') == std::string::npos && endsWith(lower(rel), ".bin")) continue;
+        if (keepExisting(rel) && exists(sd(rel))) continue;
+        if (needsBackup(rel)) backupFile(c, rel);
+        std::string out = sd(rel);
+        mkdirsFor(out);
+        std::string tmp = out + ".14tmp";
+        if (mz_zip_reader_extract_to_file(&z, i, tmp.c_str(), 0)) {
+            replaceWith(tmp, out);
+            done++;
+        } else
+            remove(tmp.c_str());
+    }
+    mz_zip_reader_end(&z);
+    return done;
+}
+
+// first .bin at the root of a zip -> given destinations
+static bool zipRootBin(const std::string& zipPath, const std::vector<std::string>& dests, Ctx& c) {
+    mz_zip_archive z;
+    memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zipPath.c_str(), 0)) return false;
+    bool ok = false;
+    for (int i = 0; i < (int)mz_zip_reader_get_num_files(&z) && !ok; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&z, i, &st)) continue;
+        std::string rel = st.m_filename;
+        if (rel.find('/') != std::string::npos || !endsWith(lower(rel), ".bin")) continue;
+        std::string first = sd("switch/14CFW/cache/payload.bin");
+        mkdirsFor(first);
+        if (!mz_zip_reader_extract_to_file(&z, i, first.c_str(), 0)) continue;
+        ok = true;
+        for (auto& d : dests) {
+            if (needsBackup(d)) backupFile(c, d);
+            std::string tmp = sd(d) + ".14tmp";
+            mkdirsFor(tmp);
+            if (copyFile(first, tmp)) replaceWith(tmp, sd(d));
+        }
+        remove(first.c_str());
+    }
+    mz_zip_reader_end(&z);
     return ok;
 }
 
-static std::string bootIni(const Env& env) {
-    std::string common = "fss0=atmosphere/package3\nkip1=atmosphere/kips/*\natmosphere=1\n"
-                         "logopath=bootloader/bootlogo_14cfw.bmp\nicon=bootloader/res/icon_14cfw.bmp\n";
-    std::string s =
-        "[config]\nautoboot=0\nautoboot_list=0\nbootwait=3\nbacklight=100\nnoticker=0\nautohosoff=1\nautonogc=1\n"
-        "updater2p=1\nbootprotect=0\n\n{14CFW boot menu}\n{}\n";
-    s += "[14CFW | Atmosphere]\n" + common + "\n";
-    if (env.emummc) s += "[14CFW | Atmosphere emuMMC]\nemummcforce=1\n" + common + "\n";
-    s += "[14CFW | Atmosphere sysMMC]\nemummc_force_disable=1\n" + common + "\n";
-    s += "{}\n[Stock | Original firmware]\nfss0=atmosphere/package3\nstock=1\nemummc_force_disable=1\n"
-         "logopath=bootloader/bootlogo_14cfw.bmp\nicon=bootloader/res/icon_14cfw.bmp\n";
+// ---------------------------------------------------------------- boot menu
+static std::string makeIni(const Plan& p, const Env& e, bool full) {
+    std::string logo = "bootloader/res/14cfw_logo.bmp", icon = "bootloader/res/14cfw_icon.bmp";
+    std::string common = "fss0=atmosphere/package3\nkip1=atmosphere/kips/*\natmosphere=1\nlogopath=" + logo + "\nicon=" + icon + "\n";
+    std::string s;
+    if (full) {
+        s += "[config]\nautoboot=0\nautoboot_list=0\nbootwait=3\nbacklight=100\nnoticker=0\nautohosoff=1\nautonogc=1\nupdater2p=1\nbootprotect=0\n\n";
+        s += "{14CFW boot menu}\n{}\n\n";
+    }
+    s += "[Atmosphere]\n" + common + "\n";
+    if (e.emummc) s += "[emuMMC]\nemummcforce=1\n" + common + "\n";
+    s += "[sysMMC]\nemummc_force_disable=1\n" + common + "\n";
+    s += "[Stock]\nfss0=atmosphere/package3\nemummc_force_disable=1\nstock=1\nlogopath=" + logo + "\nicon=" + icon + "\n";
+    (void)p;
     return s;
 }
 
-static bool installBootMenu(Ctx& c, const Env& env, std::string& err) {
-    c.p->setStep("Boot menu");
-    c.p->say("Boot menu: drawing logo and icon...");
-    if (!writeLogoBmp(P("bootloader/bootlogo_14cfw.bmp"), 720, 1280, 1.0f, 360.f, 520.f)) { err = "cannot write boot logo"; return false; }
-    if (!writeLogoBmp(P("bootloader/res/icon_14cfw.bmp"), 192, 192, 0.46f, 96.f, 96.f)) { err = "cannot write icon"; return false; }
-    std::string rel = c.o.replaceMenu ? "bootloader/hekate_ipl.ini" : "bootloader/ini/14CFW.ini";
-    bool ex = exists(P(rel));
-    if (ex && !backupFile(c, rel)) { err = "could not back up " + rel; return false; }
-    mkdirs(P(rel));
-    std::string tmp = P(rel) + ".14tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary);
-        out << bootIni(env);
-        if (!out.good()) { err = "cannot write boot menu"; return false; }
+static bool installBootMenu(Ctx& c, const Env& e) {
+    const Plan& p = *c.plan;
+    std::string tmp = sd("switch/14CFW/cache/logo.tmp");
+    mkdirsFor(tmp);
+    if (!writeBootLogoBmp(tmp)) return false;
+    mkdirs(sd("bootloader/res"));
+    if (!replaceWith(tmp, sd("bootloader/res/14cfw_logo.bmp"))) return false;
+    if (!writeIconBmp(tmp)) return false;
+    if (!replaceWith(tmp, sd("bootloader/res/14cfw_icon.bmp"))) return false;
+    if (p.replaceIni) {
+        // Hekate's own startup logo too
+        if (!exists(sd("bootloader/bootlogo.bmp")) || p.backup) {
+            backupFile(c, "bootloader/bootlogo.bmp");
+            copyFile(sd("bootloader/res/14cfw_logo.bmp"), sd("bootloader/bootlogo.bmp"));
+        }
+        backupFile(c, "bootloader/hekate_ipl.ini");
+        return writeText(sd("bootloader/hekate_ipl.ini"), makeIni(p, e, true));
     }
-    if (!commitTmp(tmp, P(rel))) { err = "cannot save boot menu"; return false; }
-    c.p->say(std::string("Boot menu written to ") + rel + (ex ? " (old one backed up)" : ""));
-    c.p->ok++;
-    return true;
+    mkdirs(sd("bootloader/ini"));
+    return writeText(sd("bootloader/ini/14CFW.ini"), makeIni(p, e, false));
 }
 
-// ------------------------------------------------------------------ install
-static bool preflight(const Env& env, Progress& p, unsigned long long need) {
-    if (env.battery >= 0 && env.battery < 30 && !env.charging) {
-        p.say("Battery is below 30%. Plug in the charger first.");
-        return false;
-    }
-    if (!env.sdOk) { p.say("Cannot read the SD card."); return false; }
-    if (env.freeBytes < need) {
-        p.say("Not enough free space: need about " + humanSize(need) + ", have " + humanSize(env.freeBytes));
-        return false;
-    }
-    return true;
-}
-
-static bool installOne(Ctx& c, const Component& comp, float base, float span, std::string& err) {
-    Progress& p = *c.p;
-    c.extracted.clear();
-    Release rel;
-    if (!comp.repo.empty()) {
-        p.setStep("Looking up " + comp.name);
-        if (!fetchRelease(comp.repo, rel, err)) return false;
-    }
-    struct Job { std::string url, name, to; bool zip; };
-    std::vector<Job> jobs;
-    auto baseName = [](const std::string& u) {
-        size_t s = u.find_last_of('/');
-        std::string n = s == std::string::npos ? u : u.substr(s + 1);
-        size_t q = n.find('?');
-        return q == std::string::npos ? n : n.substr(0, q);
-    };
-    if (!comp.url.empty()) {
-        jobs.push_back({comp.url, baseName(comp.url), comp.to, comp.type == "zip"});
-    } else {
-        const Asset* a = pickAsset(rel, comp.asset, comp.skip);
-        if (!a) { err = "no matching file in latest release (" + rel.tag + ")"; return false; }
-        jobs.push_back({a->url, a->name, comp.to, comp.type == "zip"});
-    }
-    for (auto& ex : comp.extras) {
-        const Asset* a = pickAsset(rel, ex.asset, "");
-        if (!a) { p.say("  ! extra file " + ex.asset + " not found, skipping"); continue; }
-        jobs.push_back({a->url, a->name, ex.to, false});
-    }
-    p.say("Installing " + comp.name + (rel.tag.empty() ? "" : " " + rel.tag));
-    for (size_t j = 0; j < jobs.size(); j++) {
-        if (p.cancel) { err = "cancelled"; return false; }
-        float jb = base + span * (float)j / (float)jobs.size(), js = span / (float)jobs.size();
-        std::string cache = std::string(CACHE_DIR) + "/" + comp.id + "-" + jobs[j].name;
-        p.setStep("Downloading " + jobs[j].name);
-        p.overall = jb;
-        std::string e2;
-        if (!download(p, jobs[j].url, cache, e2)) { err = e2; return false; }
-        p.overall = jb + js * 0.6f;
-        p.setStep("Installing " + jobs[j].name);
-        bool ok;
-        if (jobs[j].zip) ok = extractZip(c, cache, e2);
-        else ok = placeFile(c, cache, jobs[j].to, e2);
-        remove(cache.c_str());
-        if (!ok) { err = e2; return false; }
-        p.overall = jb + js;
-    }
-    if (!comp.postPattern.empty() && !comp.postTo.empty()) {
-        for (auto& rel2 : c.extracted) {
-            if (rel2.find('/') == std::string::npos && wild(comp.postPattern.c_str(), rel2.c_str())) {
-                std::string e3;
-                placeFile(c, P(rel2), comp.postTo, e3);
-                p.say("  " + rel2 + " -> " + comp.postTo);
+// ---------------------------------------------------------------- homebrew
+static bool installApp(Ctx& c, const HbApp& a) {
+    std::vector<Asset> as;
+    std::string tag;
+    if (!latestAssets(a.repo, as, tag)) return false;
+    const Asset* pick = nullptr;
+    for (int pass = 0; pass < 4 && !pick; pass++)
+        for (auto& x : as) {
+            std::string n = lower(x.name);
+            bool nro = endsWith(n, ".nro"), zip = endsWith(n, ".zip"), hint = n.find(lower(a.hint)) != std::string::npos;
+            if ((pass == 0 && nro && hint) || (pass == 1 && nro) || (pass == 2 && zip && hint) || (pass == 3 && zip)) {
+                pick = &x;
                 break;
             }
         }
-    }
-    return true;
-}
-
-void install(std::vector<Component> comps, Options o, Env env, Progress& p) {
-    std::vector<Component> todo;
-    for (auto& c : comps)
-        if (c.selected) todo.push_back(c);
-    if (todo.empty() && !o.withBootMenu) { p.say("Nothing selected."); p.done = true; return; }
-    if (!preflight(env, p, 300ull << 20)) { p.failedHard = true; p.done = true; return; }
-
-    Ctx c;
-    c.o = o;
-    c.p = &p;
-    char stamp[32];
-    snprintf(stamp, sizeof stamp, "%llu", (unsigned long long)time(NULL));
-    c.bdir = std::string(BACKUP_DIR) + "/" + stamp;
-    p.backupDir = c.bdir;
-    p.say("Your games, saves and emuMMC are never touched.");
-    if (o.backup) p.say("Backups go to switch/14CFW/backup/" + std::string(stamp));
-    if (!env.tlsOk) p.say("Note: no cacert.pem found, downloads are not certificate-checked.");
-
-    int n = (int)todo.size() + (o.withBootMenu ? 1 : 0);
-    int idx = 0;
-    std::vector<std::string> failedNames;
-    for (auto& comp : todo) {
-        if (p.cancel) break;
-        float base = (float)idx / (float)n, span = 1.f / (float)n;
-        std::string err;
-        if (!installOne(c, comp, base, span, err)) {
-            p.say("  FAILED: " + comp.name + " - " + err);
-            failedNames.push_back(comp.name);
-            p.failed++;
-            if (err == "cancelled") break;
-        } else {
-            p.say("  done: " + comp.name);
+    if (!pick) return false;
+    bool isZip = endsWith(lower(pick->name), ".zip");
+    std::string dl = sd("switch/14CFW/cache/" + std::string(a.id) + (isZip ? ".zip" : ".nro"));
+    if (!httpFile(pick->url, dl, *c.pr, c.pr->frac, 0.0f)) return false;
+    bool ok = false;
+    std::string folder = std::string("switch/") + a.name;
+    if (!isZip) {
+        mkdirs(sd(folder));
+        std::string out = sd(folder + "/" + a.name + ".nro");
+        std::string tmp = out + ".14tmp";
+        ok = copyFile(dl, tmp) && replaceWith(tmp, out);
+    } else {
+        mz_zip_archive z;
+        memset(&z, 0, sizeof z);
+        if (mz_zip_reader_init_file(&z, dl.c_str(), 0)) {
+            bool hasSwitch = false;
+            int n = (int)mz_zip_reader_get_num_files(&z);
+            for (int i = 0; i < n; i++) {
+                mz_zip_archive_file_stat st;
+                if (mz_zip_reader_file_stat(&z, i, &st) && startsWith(lower(st.m_filename), "switch/")) hasSwitch = true;
+            }
+            if (hasSwitch) {
+                mz_zip_reader_end(&z);
+                ok = extractZip(c, dl, false) > 0;
+            } else {
+                for (int i = 0; i < n; i++) {
+                    mz_zip_archive_file_stat st;
+                    if (!mz_zip_reader_file_stat(&z, i, &st) || mz_zip_reader_is_file_a_directory(&z, i)) continue;
+                    std::string rel = st.m_filename;
+                    if (!endsWith(lower(rel), ".nro") || rel.find("..") != std::string::npos) continue;
+                    std::string base = rel.substr(rel.find_last_of('/') == std::string::npos ? 0 : rel.find_last_of('/') + 1);
+                    mkdirs(sd(folder));
+                    std::string out = sd(folder + "/" + base), tmp = out + ".14tmp";
+                    if (mz_zip_reader_extract_to_file(&z, i, tmp.c_str(), 0) && replaceWith(tmp, out)) ok = true;
+                }
+                mz_zip_reader_end(&z);
+            }
         }
-        idx++;
-        p.overall = (float)idx / (float)n;
     }
-    if (o.withBootMenu && !p.cancel) {
-        std::string err;
-        if (!installBootMenu(c, env, err)) { p.say("  FAILED: boot menu - " + err); p.failed++; }
-        p.overall = 1;
-    }
-    {
-        std::lock_guard<std::mutex> g(p.mu);
-        p.summary = std::to_string(p.ok) + " files written, " + std::to_string(p.skipped) + " kept/skipped, " +
-                    std::to_string(p.backedUp) + " backed up, " + std::to_string(p.failed) + " problems";
-    }
-    p.done = true;
+    remove(dl.c_str());
+    return ok;
 }
 
-void installBootMenuOnly(Options o, Env env, Progress& p) {
-    Ctx c;
-    c.o = o;
-    c.p = &p;
-    char stamp[32];
-    snprintf(stamp, sizeof stamp, "%llu", (unsigned long long)time(NULL));
-    c.bdir = std::string(BACKUP_DIR) + "/" + stamp;
-    p.backupDir = c.bdir;
-    std::string err;
-    if (!installBootMenu(c, env, err)) { p.say("FAILED: " + err); p.failed++; }
-    p.overall = 1;
-    {
-        std::lock_guard<std::mutex> g(p.mu);
-        p.summary = std::to_string(p.ok) + " files written, " + std::to_string(p.backedUp) + " backed up, " + std::to_string(p.failed) + " problems";
-    }
-    p.done = true;
+// ---------------------------------------------------------------- main routine
+static std::string stampNow() {
+    time_t t = time(nullptr);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char b[32];
+    strftime(b, sizeof b, "%Y%m%d-%H%M%S", &tmv);
+    return b;
 }
 
-}  // namespace inst
+void runInstall(const Plan& plan, const Env& env, Progress& pr) {
+    Ctx c{&plan, &pr, stampNow()};
+    auto fail = [&](const std::string& m) {
+        std::lock_guard<std::mutex> l(pr.m);
+        pr.error = m;
+        pr.failed = true;
+        pr.done = true;
+    };
+    bool needNet = plan.ams || plan.hekate || !plan.apps.empty();
+    int total = (plan.hekate ? 1 : 0) + (plan.ams ? 1 : 0) + (plan.bootMenu ? 1 : 0) + (int)plan.apps.size();
+    if (total == 0) {
+        pr.frac = 1;
+        pr.addLog("Nothing was selected, so nothing was changed.");
+        pr.done = true;
+        return;
+    }
+    if (!env.sdOk) return fail("The SD card can't be read.");
+    if (needNet && !env.online) return fail("Your Switch isn't connected to the internet. Connect to Wi-Fi and try again.");
+    if (env.sdFree < 200ull * 1024 * 1024 && (plan.ams || plan.hekate)) return fail("Not enough free space on the SD card (need about 200 MB).");
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    mkdirs(sd("switch/14CFW/cache"));
+    int step = 0;
+    auto base = [&]() { return (float)step / (float)total; };
+    auto span = [&]() { return 1.0f / (float)total; };
+    bool hekateAvail = env.hekate;
+
+    if (plan.hekate && !pr.cancel) {
+        pr.set("Installing Hekate", "Looking for the latest version");
+        std::vector<Asset> as;
+        std::string tag;
+        const Asset* pick = nullptr;
+        if (!latestAssets("CTCaer/hekate", as, tag)) return fail("Couldn't reach GitHub to get Hekate.");
+        for (auto& a : as)
+            if (startsWith(lower(a.name), "hekate_ctcaer") && endsWith(lower(a.name), ".zip")) pick = &a;
+        if (!pick) return fail("Couldn't find the Hekate download.");
+        pr.set("Installing Hekate", "Downloading " + tag);
+        std::string zp = sd("switch/14CFW/cache/hekate.zip");
+        if (!httpFile(pick->url, zp, pr, base(), span() * 0.8f)) return fail(pr.cancel ? "Cancelled." : "Hekate download failed.");
+        pr.set("Installing Hekate", "Unpacking");
+        if (extractZip(c, zp, true) < 0) return fail("Hekate package couldn't be opened.");
+        zipRootBin(zp, {"bootloader/update.bin", "atmosphere/reboot_payload.bin"}, c);
+        remove(zp.c_str());
+        pr.addLog("Hekate " + tag + " installed");
+        hekateAvail = true;
+        step++;
+        pr.frac = base();
+    }
+    if (plan.ams && !pr.cancel) {
+        pr.set("Installing Atmosphère", "Looking for the latest version");
+        std::vector<Asset> as;
+        std::string tag;
+        const Asset* pick = nullptr;
+        if (!latestAssets("Atmosphere-NX/Atmosphere", as, tag)) return fail("Couldn't reach GitHub to get Atmosphère.");
+        for (auto& a : as) {
+            std::string n = lower(a.name);
+            if (startsWith(n, "atmosphere-") && endsWith(n, ".zip") && n.find("without") == std::string::npos) pick = &a;
+        }
+        if (!pick) return fail("Couldn't find the Atmosphère download.");
+        pr.set("Installing Atmosphère", "Downloading " + tag);
+        std::string zp = sd("switch/14CFW/cache/atmosphere.zip");
+        if (!httpFile(pick->url, zp, pr, base(), span() * 0.8f)) return fail(pr.cancel ? "Cancelled." : "Atmosphère download failed.");
+        pr.set("Installing Atmosphère", "Unpacking (your settings are kept)");
+        int n = extractZip(c, zp, false);
+        remove(zp.c_str());
+        if (n < 0) return fail("Atmosphère package couldn't be opened.");
+        pr.addLog("Atmosphère " + tag + " installed");
+        step++;
+        pr.frac = base();
+    }
+    if (plan.bootMenu && !pr.cancel) {
+        pr.set("Setting up the 14CFW boot menu", "Writing logo, icons and entries");
+        if (!hekateAvail) {
+            pr.addLog("Boot menu skipped: it needs Hekate");
+        } else if (!installBootMenu(c, env)) {
+            pr.addLog("Warning: the boot menu couldn't be written");
+        } else
+            pr.addLog(plan.replaceIni ? "14CFW boot menu installed" : "14CFW added to Hekate's More configs");
+        step++;
+        pr.frac = base();
+    }
+    for (auto& id : plan.apps) {
+        if (pr.cancel) break;
+        for (auto& a : hbApps())
+            if (id == a.id) {
+                pr.set(std::string("Adding ") + a.name, "Downloading");
+                if (installApp(c, a)) pr.addLog(std::string(a.name) + " ready");
+                else pr.addLog(std::string("Warning: ") + a.name + " couldn't be installed");
+            }
+        step++;
+        pr.frac = base();
+    }
+    // tidy
+    remove(sd("switch/14CFW/cache/logo.tmp").c_str());
+    if (pr.cancel) return fail("Cancelled. Nothing you own was touched.");
+    if (c.backups) pr.addLog("Backed up " + std::to_string(c.backups) + " file(s) to switch/14CFW/backup/" + c.stamp);
+    pr.addLog("Your games, saves and keys were not touched");
+    pr.frac = 1;
+    pr.done = true;
+}

@@ -2,65 +2,54 @@
 #include <atomic>
 #include <mutex>
 #include <string>
-#include <utility>
 #include <vector>
 
-struct Extra { std::string asset, to; };
+extern std::string g_root;  // "sdmc:/" on the Switch
 
-struct Component {
-    std::string id, name, desc;
-    std::string repo, url, asset, skip;   // GitHub repo + asset pattern ("*" wildcard), or a direct url
-    std::string type = "zip";             // "zip" (extract to SD root) or "file" (copy to 'to')
-    std::string to;                       // destination for type "file"
-    std::vector<std::string> detect;      // paths (relative to SD root) that prove it is installed
-    std::vector<Extra> extras;            // extra release assets placed at fixed paths
-    std::string postPattern, postTo;      // after extracting: copy first entry matching pattern to postTo
-    bool defSel = false, core = false;
-    bool installed = false, selected = false;
-    std::string latest;
+struct HbApp {
+    const char* id;    // lowercase key used to detect it
+    const char* name;  // folder + display name
+    const char* repo;  // GitHub owner/repo
+    const char* hint;  // preferred asset name fragment
+    const char* desc;
 };
-
-struct Options {
-    bool backup = true;        // copy files to /switch/14CFW/backup before overwriting
-    bool keepConfigs = true;   // never overwrite existing config files
-    bool withBootMenu = true;  // also install the 14CFW boot menu
-    bool replaceMenu = true;   // true: replace bootloader/hekate_ipl.ini (backed up); false: add bootloader/ini/14CFW.ini
-};
+const std::vector<HbApp>& hbApps();
 
 struct Env {
-    bool amsRunning = false, ams = false, hekate = false, nintendo = false, emummc = false;
-    bool tlsOk = false, charging = false, sdOk = false;
-    std::string amsVer, hekateVer;
-    unsigned long long freeBytes = 0, totalBytes = 0;
-    int battery = -1;
+    bool sdOk = false;
+    unsigned long long sdFree = 0, sdTotal = 0;
+    bool online = false;
+    bool amsRunning = false;
+    std::string amsVer, fw;
+    bool amsFiles = false, hekate = false, emummc = false, nintendo = false, bootMenu = false;
+    std::vector<std::string> nros;  // lowercase names of .nro files under switch/
+};
+Env detectEnv();
+bool appPresent(const Env& e, const HbApp& a);
+std::string fmtBytes(unsigned long long b);
+
+struct Plan {
+    bool ams = true, hekate = true, bootMenu = true;
+    bool replaceIni = true;  // false: add as bootloader/ini/14CFW.ini
+    bool backup = true;
+    std::vector<std::string> apps;  // HbApp::id
 };
 
 struct Progress {
-    std::mutex mu;
+    std::atomic<float> frac{0};
+    std::atomic<bool> done{false}, failed{false}, cancel{false};
+    std::mutex m;
+    std::string step, detail, error;
     std::vector<std::string> log;
-    std::string step, backupDir, summary;
-    std::vector<std::pair<std::string, std::string>> latest;  // id -> tag (from update check)
-    float overall = 0, sub = 0;
-    std::atomic<bool> cancel{false}, done{false}, failedHard{false};
-    int ok = 0, skipped = 0, failed = 0, backedUp = 0;
-    void say(const std::string& s) {
-        std::lock_guard<std::mutex> g(mu);
-        log.push_back(s);
-        if (log.size() > 200) log.erase(log.begin());
-    }
-    void setStep(const std::string& s) {
-        std::lock_guard<std::mutex> g(mu);
+    void set(const std::string& s, const std::string& d = "") {
+        std::lock_guard<std::mutex> l(m);
         step = s;
+        detail = d;
+    }
+    void addLog(const std::string& s) {
+        std::lock_guard<std::mutex> l(m);
+        log.push_back(s);
     }
 };
 
-namespace inst {
-void init();
-void shutdown();
-void loadManifest(std::vector<Component>& out);
-void scan(std::vector<Component>& comps, Env& env);
-void checkUpdates(std::vector<Component> comps, Progress& p);
-void install(std::vector<Component> comps, Options o, Env env, Progress& p);
-void installBootMenuOnly(Options o, Env env, Progress& p);
-std::string humanSize(unsigned long long b);
-}
+void runInstall(const Plan& p, const Env& e, Progress& pr);
