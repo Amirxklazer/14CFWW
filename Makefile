@@ -7,6 +7,7 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 TARGET   := 14CFW
+DEFINES  :=
 BUILD    := build
 SOURCES  := .
 DATA     :=
@@ -14,7 +15,13 @@ INCLUDES := .
 
 APP_TITLE   := 14CFW
 APP_AUTHOR  := Amir
-APP_VERSION := 1.1.0
+APP_VERSION := 1.2.1
+
+ifeq ($(EDITION),dev)
+TARGET := 14CFW-Dev
+APP_TITLE := 14CFW Developer Edition
+DEFINES += -DDEV_EDITION
+endif
 
 ifeq ($(strip $(ICON)),)
 icons := $(wildcard *.jpg)

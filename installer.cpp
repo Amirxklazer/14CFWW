@@ -362,8 +362,8 @@ static std::string makeIni(const Plan& p, const Env& e, bool full) {
     std::string common = "fss0=atmosphere/package3\nkip1=atmosphere/kips/*\natmosphere=1\nlogopath=" + logo + "\nicon=" + icon + "\n";
     std::string s;
     if (full) {
-        s += "[config]\nautoboot=0\nautoboot_list=0\nbootwait=3\nbacklight=100\nnoticker=0\nautohosoff=1\nautonogc=1\nupdater2p=1\nbootprotect=0\n\n";
-        s += "{14CFW boot menu}\n{}\n\n";
+        s += "[config]\nautoboot=" + std::string(p.autoboot ? "1" : "0") + "\nautoboot_list=0\nbootwait=" + std::to_string(p.bootwait) + "\nbacklight=100\nnoticker=0\nautohosoff=1\nautonogc=1\nupdater2p=1\nbootprotect=0\n\n";
+        s += "{14CFW " CFW_VERSION "}\n{}\n\n";
     }
     s += "[Atmosphere]\n" + common + "\n";
     if (e.emummc) s += "[emuMMC]\nemummcforce=1\n" + common + "\n";
@@ -472,7 +472,7 @@ void runInstall(const Plan& plan, const Env& env, Progress& pr) {
         pr.done = true;
     };
     bool needNet = plan.ams || plan.hekate || !plan.apps.empty();
-    int total = (plan.hekate ? 1 : 0) + (plan.ams ? 1 : 0) + (plan.bootMenu ? 1 : 0) + (int)plan.apps.size();
+    int total = (plan.hekate ? 1 : 0) + (plan.ams ? 1 : 0) + (plan.bootMenu ? 1 : 0) + (plan.splash ? 1 : 0) + (int)plan.apps.size();
     if (total == 0) {
         pr.frac = 1;
         pr.addLog("Nothing was selected, so nothing was changed.");
@@ -543,6 +543,23 @@ void runInstall(const Plan& plan, const Env& env, Progress& pr) {
         step++;
         pr.frac = base();
     }
+    if (plan.splash && !pr.cancel) {
+        pr.set("Putting your 14 on the Atmosphère splash", "Patching package3");
+        std::string p3 = sd("atmosphere/package3"), err;
+        if (!exists(p3)) {
+            pr.addLog("Warning: splash skipped, Atmosphère isn't installed yet");
+        } else {
+            std::string tmp = p3 + ".14tmp";
+            if (!plan.ams) backupFile(c, "atmosphere/package3");
+            if (buildPatchedPackage3(p3, tmp, err) && replaceWith(tmp, p3)) pr.addLog("14CFW " CFW_VERSION " splash installed");
+            else {
+                remove(tmp.c_str());
+                pr.addLog("Warning: splash skipped, " + err);
+            }
+        }
+        step++;
+        pr.frac = base();
+    }
     for (auto& id : plan.apps) {
         if (pr.cancel) break;
         for (auto& a : hbApps())
@@ -555,10 +572,67 @@ void runInstall(const Plan& plan, const Env& env, Progress& pr) {
         pr.frac = base();
     }
     // tidy
+    if (plan.tweaks && !pr.cancel && !exists(sd("atmosphere/config/system_settings.ini"))) {
+        // recommended defaults (only when you have no settings file yet): no telemetry upload, relaxed NRO checks
+        if (writeText(sd("atmosphere/config/system_settings.ini"),
+                      "[eupld]\nupload_enabled = u8!0x0\n\n[ro]\nease_nro_restriction = u8!0x1\n"))
+            pr.addLog("Recommended Atmosphère settings added");
+    }
     remove(sd("switch/14CFW/cache/logo.tmp").c_str());
     if (pr.cancel) return fail("Cancelled. Nothing you own was touched.");
     if (c.backups) pr.addLog("Backed up " + std::to_string(c.backups) + " file(s) to switch/14CFW/backup/" + c.stamp);
     pr.addLog("Your games, saves and keys were not touched");
     pr.frac = 1;
     pr.done = true;
+}
+
+// ---------------------------------------------------------------- settings
+Settings loadSettings() {
+    Settings s;
+    FILE* f = fopen(sd("switch/14CFW/settings.ini").c_str(), "rb");
+    if (!f) return s;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        std::string k = line;
+        int v = atoi(eq + 1);
+        if (k == "backup") s.backup = v != 0;
+        else if (k == "replace_menu") s.replaceIni = v != 0;
+        else if (k == "splash") s.splash = v != 0;
+        else if (k == "autoboot") s.autoboot = v != 0;
+        else if (k == "tweaks") s.tweaks = v != 0;
+        else if (k == "bootwait") s.bootwait = (v == 0 || v == 3 || v == 5 || v == 10) ? v : 3;
+    }
+    fclose(f);
+    return s;
+}
+bool saveSettings(const Settings& s) {
+    std::string t = "backup=" + std::to_string(s.backup) + "\nreplace_menu=" + std::to_string(s.replaceIni) + "\nsplash=" + std::to_string(s.splash) +
+                    "\ntweaks=" + std::to_string(s.tweaks) + "\nautoboot=" + std::to_string(s.autoboot) + "\nbootwait=" + std::to_string(s.bootwait) + "\n";
+    return writeText(sd("switch/14CFW/settings.ini"), t);
+}
+
+bool restoreOldMenu(std::string& msg) {
+    std::string best;
+    DIR* d = opendir(sd("switch/14CFW/backup").c_str());
+    if (d) {
+        while (dirent* en = readdir(d)) {
+            std::string n = en->d_name;
+            if (n == "." || n == "..") continue;
+            if (exists(sd("switch/14CFW/backup/" + n + "/bootloader/hekate_ipl.ini")) && n > best) best = n;
+        }
+        closedir(d);
+    }
+    if (best.empty()) {
+        msg = "No backup found";
+        return false;
+    }
+    if (!copyFile(sd("switch/14CFW/backup/" + best + "/bootloader/hekate_ipl.ini"), sd("bootloader/hekate_ipl.ini"))) {
+        msg = "Couldn't restore";
+        return false;
+    }
+    msg = "Restored";
+    return true;
 }

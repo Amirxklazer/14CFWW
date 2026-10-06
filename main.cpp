@@ -156,14 +156,16 @@ static void spinner(float cx, float cy, float r, double t) {  // Windows-style f
 }
 
 // ------------------------------------------------------------------ state
-enum Page { P_HELLO, P_SCAN, P_FOUND, P_MODE, P_CORE, P_APPS, P_OPTS, P_INSTALL, P_DONE, P_ERROR };
-enum Act { A_NONE, A_START, A_NEXT, A_BACK, A_EXPRESS, A_CUSTOM, A_INSTALL, A_EXIT, A_REBOOT, A_RETRY };
+enum Page { P_HELLO, P_SCAN, P_FOUND, P_MODE, P_CORE, P_APPS, P_OPTS, P_INSTALL, P_DONE, P_ERROR, P_SETTINGS };
+enum Act { A_NONE, A_START, A_NEXT, A_BACK, A_EXPRESS, A_CUSTOM, A_INSTALL, A_EXIT, A_REBOOT, A_RETRY, A_SETTINGS, A_ALREADY };
 
 struct Row {
     std::string title, sub, tag;
     SDL_Color tagCol = WHITE;
     bool* val = nullptr;  // toggle
     bool dis = false;
+    int* cyc = nullptr;  // value that cycles through 0,3,5,10
+    int act = 0;         // 1 = restore old boot menu
 };
 struct Btn {
     std::string label;
@@ -178,7 +180,28 @@ static double g_pageT = 0, g_now = 0;
 static int g_focus = 0, g_scroll = 0;  // focus: row index, or rows.size()+btn index
 static Env g_env;
 static Plan g_plan;
-static bool g_ams = true, g_hek = true, g_menu = true, g_replace = true, g_backup = true;
+static bool g_ams = true, g_hek = true, g_menu = true, g_splash = true, g_replace = true, g_backup = true, g_autoboot = false, g_updateMode = false, g_tweaks = true;
+static std::string g_msg;
+static int g_wait = 3;
+static bool isList();  // defined below
+static void persist() {
+    Settings s;
+    s.backup = g_backup;
+    s.replaceIni = g_replace;
+    s.splash = g_splash;
+    s.autoboot = g_autoboot;
+    s.tweaks = g_tweaks;
+    s.bootwait = g_wait;
+    saveSettings(s);
+}
+static void applySettings(const Settings& s) {
+    g_backup = s.backup;
+    g_replace = s.replaceIni;
+    g_splash = s.splash;
+    g_autoboot = s.autoboot;
+    g_tweaks = s.tweaks;
+    g_wait = s.bootwait;
+}
 static std::vector<char> g_appOn;
 static double g_scanStart = 0;
 static Progress* g_pr = nullptr;
@@ -196,6 +219,7 @@ static void goPage(Page p, bool push = true) {
     g_focus = 0;
     g_scroll = 0;
     if (p == P_SCAN) {
+        g_updateMode = false;
         g_scanStart = g_now;
         g_env = detectEnv();
         if (g_appOn.size() != hbApps().size()) {
@@ -204,6 +228,7 @@ static void goPage(Page p, bool push = true) {
     }
 }
 static void goBack() {
+    if (g_page == P_SETTINGS) persist();
     if (g_stack.empty()) return;
     Page p = g_stack.back();
     g_stack.pop_back();
@@ -218,18 +243,24 @@ static void goBack() {
 static void startInstall(bool express) {
     g_plan = Plan();
     if (express) {
-        g_plan.ams = g_plan.hekate = g_plan.bootMenu = true;
-        g_plan.replaceIni = g_plan.backup = true;
+        g_plan.ams = g_plan.hekate = g_plan.bootMenu = g_plan.splash = true;
+        g_plan.replaceIni = g_replace;
+        g_plan.backup = g_backup;
+        g_plan.splash = g_splash;
         for (auto& a : hbApps()) g_plan.apps.push_back(a.id);
     } else {
         g_plan.ams = g_ams;
         g_plan.hekate = g_hek;
         g_plan.bootMenu = g_menu;
+        g_plan.splash = g_splash;
         g_plan.replaceIni = g_replace;
         g_plan.backup = g_backup;
         for (size_t i = 0; i < hbApps().size(); i++)
             if (g_appOn[i]) g_plan.apps.push_back(hbApps()[i].id);
     }
+    g_plan.tweaks = g_tweaks;
+    g_plan.autoboot = g_autoboot;
+    g_plan.bootwait = g_wait;
     if (g_th.joinable()) g_th.join();
     delete g_pr;
     g_pr = new Progress();
@@ -253,6 +284,7 @@ static void buildPage() {
     case P_HELLO:
         title = "Hi there";
         sub = "Let's get your Switch set up with Atmosphère, Hekate and your favorite homebrew.";
+        addBtn("Settings", A_SETTINGS, false);
         addBtn("Let's go", A_START, true);
         break;
     case P_SCAN:
@@ -301,12 +333,13 @@ static void buildPage() {
         snprintf(t, sizeof t, "%d of %d", n, (int)hbApps().size());
         r.tag = t;
         g_rows.push_back(r);
+        if (g_env.amsFiles || g_env.hekate || g_env.bootMenu) addBtn("Already installed", A_ALREADY, false);
         addBtn("Next", A_NEXT, true);
         break;
     }
     case P_MODE:
         title = "Get going fast";
-        sub = "Express installs Atmosphère, Hekate, the 14CFW boot menu and the homebrew pack. Your games, saves and settings stay exactly as they are.";
+        sub = "Express installs Atmosphère, Hekate, the 14CFW boot menu and splash, and the homebrew pack. Your games, saves and settings stay exactly as they are.";
         if (!g_env.online) {
             Row r;
             r.title = "Your Switch isn't online";
@@ -316,12 +349,12 @@ static void buildPage() {
             r.tagCol = WARN;
             g_rows.push_back(r);
         }
-        addBtn("Use Express settings", A_EXPRESS, true);
         addBtn("Customize", A_CUSTOM, false);
+        addBtn("Use Express settings", A_EXPRESS, true);
         break;
     case P_CORE: {
-        title = "Customize your install";
-        sub = "Choose what goes on your SD card.";
+        title = g_updateMode ? "Update what's installed" : "Customize your install";
+        sub = g_updateMode ? "We found these on your SD card. Pick what to update." : "Choose what goes on your SD card.";
         Row r;
         r.title = "Atmosphère";
         r.sub = g_env.amsFiles ? "Custom firmware. Already here: will update, settings kept." : "Custom firmware for your Switch.";
@@ -338,13 +371,18 @@ static void buildPage() {
         r.val = &g_menu;
         r.dis = !g_hek && !g_env.hekate;
         g_rows.push_back(r);
+        r = Row();
+        r.title = "14 splash screen";
+        r.sub = "Replaces the Atmosphère logo at boot with your 14.";
+        r.val = &g_splash;
+        g_rows.push_back(r);
         addBtn("Back", A_BACK, false);
         addBtn("Next", A_NEXT, true);
         break;
     }
     case P_APPS:
-        title = "Homebrew pack";
-        sub = "Pick the apps you want. Ones you already have get updated.";
+        title = g_updateMode ? "Update your apps" : "Homebrew pack";
+        sub = g_updateMode ? "Apps already on your Switch are selected." : "Pick the apps you want. Ones you already have get updated.";
         for (size_t i = 0; i < hbApps().size(); i++) {
             Row r;
             r.title = hbApps()[i].name;
@@ -379,6 +417,54 @@ static void buildPage() {
         addBtn("Install", A_INSTALL, true);
         break;
     }
+    case P_SETTINGS: {
+        title = "14CFW settings";
+        sub = "Saved on your SD card. They apply to every install.";
+        Row r;
+        r.title = "Back up files I replace";
+        r.sub = "Copies go to switch/14CFW/backup.";
+        r.val = &g_backup;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Replace Hekate's boot menu";
+        r.sub = "Off: 14CFW is added under Hekate's More configs instead.";
+        r.val = &g_replace;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "14 splash screen";
+        r.sub = "Your 14 instead of the Atmosphère logo.";
+        r.val = &g_splash;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Recommended Atmosphère settings";
+        r.sub = "No Nintendo telemetry upload. Only added if you have no settings file.";
+        r.val = &g_tweaks;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Boot straight into Atmosphère";
+        r.sub = "Skips the menu after the wait. Hold Vol- at boot to open it.";
+        r.val = &g_autoboot;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Boot menu wait";
+        r.sub = "How long the menu waits. A changes it.";
+        r.cyc = &g_wait;
+        r.tag = g_wait ? std::to_string(g_wait) + " seconds" : "No wait";
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Restore my old boot menu";
+        r.sub = "Puts back the hekate_ipl.ini that 14CFW backed up.";
+        r.act = 1;
+        r.tag = g_msg.empty() ? "Press A" : g_msg;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "About";
+        r.sub = "14CFW by Amir";
+        r.tag = "Version " CFW_VERSION;
+        g_rows.push_back(r);
+        addBtn("Done", A_BACK, true);
+        break;
+    }
     case P_INSTALL:
         title = "Setting things up";
         sub = "This might take a few minutes. Don't turn off your Switch.";
@@ -409,9 +495,17 @@ static bool rowOn(int i) {
     return g_rows[i].val && *g_rows[i].val;
 }
 static bool rowIsToggle(int i) { return g_page == P_APPS || g_rows[i].val; }
+static bool isList() { return g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS || g_page == P_SETTINGS; }
 static void rowFlip(int i) {
     if (g_rows[i].dis) return;
-    if (g_page == P_APPS) g_appOn[i] = !g_appOn[i];
+    if (g_rows[i].act == 1) {
+        restoreOldMenu(g_msg);
+    } else if (g_rows[i].cyc) {
+        static const int steps[] = {0, 3, 5, 10};
+        int k = 0;
+        for (int j = 0; j < 4; j++) if (steps[j] == *g_rows[i].cyc) k = j;
+        *g_rows[i].cyc = steps[(k + 1) % 4];
+    } else if (g_page == P_APPS) g_appOn[i] = !g_appOn[i];
     else if (g_rows[i].val) *g_rows[i].val = !*g_rows[i].val;
 }
 
@@ -425,7 +519,16 @@ static void doAct(Act a) {
         break;
     case A_BACK: goBack(); break;
     case A_EXPRESS: startInstall(true); break;
-    case A_CUSTOM: goPage(P_CORE); break;
+    case A_CUSTOM: g_updateMode = false; goPage(P_CORE); break;
+    case A_SETTINGS: goPage(P_SETTINGS); break;
+    case A_ALREADY:
+        g_updateMode = true;
+        g_ams = g_env.amsFiles;
+        g_hek = g_env.hekate;
+        g_menu = g_env.bootMenu || g_env.hekate;
+        for (size_t i = 0; i < hbApps().size(); i++) g_appOn[i] = appPresent(g_env, hbApps()[i]);
+        goPage(P_CORE);
+        break;
     case A_INSTALL: startInstall(false); break;
     case A_EXIT: g_quit = true; break;
     case A_REBOOT: g_reboot = true; g_quit = true; break;
@@ -446,7 +549,7 @@ static void handleInput(const In& in) {
     }
     buildPage();
     int nr = (int)g_rows.size(), nb = (int)g_btns.size();
-    bool listPage = (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS);
+    bool listPage = isList();
     if (in.tap) {
         for (int i = 0; i < nb; i++) {
             SDL_Rect r = g_btns[i].r;
@@ -463,6 +566,7 @@ static void handleInput(const In& in) {
             }
     }
     unsigned d = in.down;
+    if ((d & K_Y) && (g_page == P_HELLO || g_page == P_FOUND || g_page == P_MODE)) return doAct(A_SETTINGS);
     if (d & K_B) {
         if (g_page == P_HELLO) g_quit = true;
         else if (g_page == P_DONE || g_page == P_ERROR) g_quit = true;
@@ -515,12 +619,14 @@ static void drawStatus() {
     struct H2 { const char *k, *l; };
     std::vector<H2> hs;
     if (g_page == P_INSTALL) hs = {{"B", "Cancel"}};
-    else if (g_page == P_HELLO) hs = {{"A", "Start"}, {"B", "Exit"}};
+    else if (g_page == P_HELLO) hs = {{"A", "Start"}, {"X", "Settings"}, {"B", "Exit"}};
     else if (g_page == P_SCAN) hs = {};
-    else if (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS) hs = {{"A", "Select"}, {"B", "Back"}, {"+", "Next"}};
+    else if (g_page == P_SETTINGS) hs = {{"A", "Change"}, {"B", "Done"}};
+    else if (isList()) hs = {{"A", "Select"}, {"B", "Back"}, {"+", "Next"}};
     else if (g_page == P_MODE) hs = {{"A", "Express"}, {"X", "Customize"}, {"B", "Back"}};
     else if (g_page == P_DONE || g_page == P_ERROR) hs = {{"A", "Continue"}, {"B", "Exit"}};
     else hs = {{"A", "Next"}, {"B", "Back"}};
+    if (g_page == P_FOUND) { hs = {{"A", "Next"}, {"B", "Back"}, {"Y", "Settings"}}; if (g_env.amsFiles || g_env.hekate || g_env.bootMenu) hs.insert(hs.begin() + 1, {"X", "Already installed"}); }
     for (auto& h : hs) {
         chip(h.k, x, y);
         x += 30;
@@ -572,10 +678,14 @@ static void drawFrame(double now) {
         SDL_Rect d{W - MX - 278 - 60 + g_dx, 130, 278, 416};
         SDL_RenderCopy(g_r, texBig, nullptr, &d);
     }
+#ifdef DEV_EDITION
+    text(fB, "DEVELOPER EDITION", W - MX, 40, DIM, 255, 2, false);
+#endif
     int titleF = (g_page == P_HELLO) ? 1 : 0;
     if (titleF) text(fXL, title, MX, 150, WHITE);
     else text(fL, title, MX, 82, WHITE);
     int subY = titleF ? 280 : 150;
+    if (g_page == P_HELLO) text(fS, "14CFW " CFW_VERSION, MX, 120, DIM);
     if (!sub.empty()) wrap(fM, sub, MX, subY, g_page == P_HELLO ? 560 : 900, DIM, 36);
 
     // content
@@ -589,7 +699,7 @@ static void drawFrame(double now) {
             y += rh + gap;
         }
         if (g_page == P_MODE && g_env.online) {
-            const char* l[] = {"Atmosphère and Hekate (latest)", "14CFW boot menu with your logo", "Homebrew pack: save manager, file manager, FTP and more", "Backups of anything it replaces"};
+            const char* l[] = {"Atmosphère and Hekate (latest)", "14CFW boot menu and splash with your logo", "Homebrew pack: save manager, file manager, FTP and more", "Backups of anything it replaces"};
             int yy = 270;
             (void)l;
             (void)yy;
@@ -599,7 +709,7 @@ static void drawFrame(double now) {
                 text(fM, l[i], cx + 26, by + i * 38, WHITE);
             }
         }
-    } else if (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS) {
+    } else if (isList()) {
         int rh = 64, pitch = 72, top = 212, vis = 5;
         int nr = (int)g_rows.size();
         if (g_focus < nr) {
@@ -674,7 +784,7 @@ static void drawFrame(double now) {
 
     // buttons
     int nr = (int)g_rows.size();
-    bool listPage = (g_page == P_CORE || g_page == P_APPS || g_page == P_OPTS);
+    bool listPage = isList();
     for (size_t i = 0; i < g_btns.size(); i++) {
         const Btn& b = g_btns[i];
         bool foc = listPage && g_focus == nr + (int)i;
@@ -748,6 +858,7 @@ static bool uiInit() {
     if (logoLoad(LOGO_S_ICON, ic)) texIcon = mkTex(ic);
     if (!texBig) { Rgba e; e.w = e.h = 1; e.px = {0, 0, 0, 0}; texBig = mkTex(e); }
     g_appOn.assign(hbApps().size(), 1);
+    applySettings(loadSettings());
     return true;
 }
 

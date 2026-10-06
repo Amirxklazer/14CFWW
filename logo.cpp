@@ -1,10 +1,14 @@
 #include "logo.hpp"
+#ifdef DEV_EDITION
+#include "logo_data_dev.h"
+#else
 #include "logo_data.h"
+#endif
 #include <cstdio>
 #include <cstring>
 
 bool logoLoad(LogoSize s, Rgba& out) {
-    const EmbImg* e = s == LOGO_S_BIG ? &LOGO_BIG : &LOGO_ICON;
+    const EmbImg* e = s == LOGO_S_BIG ? &LOGO_BIG : s == LOGO_S_ICON ? &LOGO_ICON : &LOGO_TAG;
     out.w = e->w;
     out.h = e->h;
     out.px.assign((size_t)e->rawlen, 0);
@@ -102,4 +106,40 @@ bool writeIconBmp(const std::string& path) {
     }
     fclose(f);
     return ok;
+}
+
+// Atmosphere's splash lives at 0x400000 in package3: 1280 rows of 768 BGRA pixels (720 used), i.e. the
+// 720x1280 portrait panel image, same orientation as Hekate's logopath file.
+bool buildPatchedPackage3(const std::string& path, const std::string& outPath, std::string& err) {
+    const size_t P3 = 0x800000, OFF = 0x400000, STRIDE = 768;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { err = "package3 not found"; return false; }
+    std::vector<unsigned char> d(P3);
+    size_t n = fread(d.data(), 1, P3, f);
+    unsigned char extra;
+    bool bigger = fread(&extra, 1, 1, f) == 1;
+    fclose(f);
+    if (n != P3 || bigger || memcmp(d.data(), "PK31", 4) != 0) { err = "this Atmosphere version has a different package3 layout"; return false; }
+    Rgba lg;
+    if (!logoLoad(LOGO_S_BIG, lg)) { err = "logo data failed to load"; return false; }
+    const int LW = 1280, LH = 720;
+    int ox = (LW - lg.w) / 2, oy = (LH - lg.h) / 2;  // just the 14, centered
+    for (int py = 0; py < 1280; py++) {
+        unsigned char* row = &d[OFF + (size_t)py * STRIDE * 4];
+        for (int px = 0; px < 720; px++) {
+            int lx = LW - 1 - py, ly = px;  // landscape position of this panel pixel
+            unsigned char r, g, b;
+            pixelOverWhite(lg, lx - ox, ly - oy, r, g, b);
+            unsigned char* o = row + px * 4;
+            o[0] = b; o[1] = g; o[2] = r; o[3] = 255;
+        }
+        memset(row + 720 * 4, 0, (STRIDE - 720) * 4);
+    }
+    (void)LH;
+    FILE* o = fopen(outPath.c_str(), "wb");
+    if (!o) { err = "couldn't write to the SD card"; return false; }
+    bool ok = fwrite(d.data(), 1, P3, o) == P3;
+    fclose(o);
+    if (!ok) { err = "SD card write failed"; return false; }
+    return true;
 }

@@ -9,7 +9,7 @@ struct Rgba {
     std::vector<unsigned char> px;
 };
 
-enum LogoSize { LOGO_S_BIG, LOGO_S_ICON };
+enum LogoSize { LOGO_S_BIG, LOGO_S_ICON, LOGO_S_TAG };
 
 // zlib inflate; implemented in installer.cpp (miniz) so the header-only miniz is only compiled once.
 bool zinflate(const unsigned char* z, size_t zlen, unsigned char* out, size_t rawLen);
@@ -22,3 +22,7 @@ bool writeBootLogoBmp(const std::string& path);
 
 // 192x192 BMP for Hekate's "icon".
 bool writeIconBmp(const std::string& path);
+
+// Replaces the Atmosphere boot splash inside an atmosphere/package3 file (1280x720, your 14 + version tag).
+// Writes the patched copy to outPath; the original is left alone. Returns false (with err) if the file isn't what we expect.
+bool buildPatchedPackage3(const std::string& package3, const std::string& outPath, std::string& err);
