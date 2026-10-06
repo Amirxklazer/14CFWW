@@ -180,7 +180,7 @@ static double g_pageT = 0, g_now = 0;
 static int g_focus = 0, g_scroll = 0;  // focus: row index, or rows.size()+btn index
 static Env g_env;
 static Plan g_plan;
-static bool g_ams = true, g_hek = true, g_menu = true, g_splash = true, g_replace = true, g_backup = true, g_autoboot = false, g_updateMode = false, g_tweaks = true;
+static bool g_ams = true, g_hek = true, g_menu = true, g_splash = true, g_replace = true, g_backup = true, g_autoboot = false, g_updateMode = false, g_tweaks = true, g_official = false;
 static std::string g_msg;
 static int g_wait = 3;
 static bool isList();  // defined below
@@ -191,6 +191,7 @@ static void persist() {
     s.splash = g_splash;
     s.autoboot = g_autoboot;
     s.tweaks = g_tweaks;
+    s.officialAms = g_official;
     s.bootwait = g_wait;
     saveSettings(s);
 }
@@ -200,6 +201,7 @@ static void applySettings(const Settings& s) {
     g_splash = s.splash;
     g_autoboot = s.autoboot;
     g_tweaks = s.tweaks;
+    g_official = s.officialAms;
     g_wait = s.bootwait;
 }
 static std::vector<char> g_appOn;
@@ -259,6 +261,7 @@ static void startInstall(bool express) {
             if (g_appOn[i]) g_plan.apps.push_back(hbApps()[i].id);
     }
     g_plan.tweaks = g_tweaks;
+    g_plan.officialAms = g_official;
     g_plan.autoboot = g_autoboot;
     g_plan.bootwait = g_wait;
     if (g_th.joinable()) g_th.join();
@@ -434,6 +437,11 @@ static void buildPage() {
         r.title = "14 splash screen";
         r.sub = "Your 14 instead of the Atmosphère logo.";
         r.val = &g_splash;
+        g_rows.push_back(r);
+        r = Row();
+        r.title = "Use the official Atmosphère";
+        r.sub = "Off: 14CFW's own build, which shows 14CFW in System Settings.";
+        r.val = &g_official;
         g_rows.push_back(r);
         r = Row();
         r.title = "Recommended Atmosphère settings";

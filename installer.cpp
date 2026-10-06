@@ -515,10 +515,24 @@ void runInstall(const Plan& plan, const Env& env, Progress& pr) {
         std::vector<Asset> as;
         std::string tag;
         const Asset* pick = nullptr;
-        if (!latestAssets("Atmosphere-NX/Atmosphere", as, tag)) return fail("Couldn't reach GitHub to get Atmosphère.");
-        for (auto& a : as) {
-            std::string n = lower(a.name);
-            if (startsWith(n, "atmosphere-") && endsWith(n, ".zip") && n.find("without") == std::string::npos) pick = &a;
+        Asset own;
+        bool usedOwn = false;
+        if (!plan.officialAms) {
+            std::string body, url, otag;
+            if (httpGet(std::string("https://api.github.com/repos/") + CFW_REPO + "/releases?per_page=20", body) && parseOwnAms(body, url, otag)) {
+                own = {"14cfw-atmosphere.zip", url, otag};
+                pick = &own;
+                tag = otag;
+                usedOwn = true;
+            } else
+                pr.addLog("14CFW's own Atmosphère build isn't available yet, using the official one");
+        }
+        if (!pick) {
+            if (!latestAssets("Atmosphere-NX/Atmosphere", as, tag)) return fail("Couldn't reach GitHub to get Atmosphère.");
+            for (auto& a : as) {
+                std::string n = lower(a.name);
+                if (startsWith(n, "atmosphere-") && endsWith(n, ".zip") && n.find("without") == std::string::npos) pick = &a;
+            }
         }
         if (!pick) return fail("Couldn't find the Atmosphère download.");
         pr.set("Installing Atmosphère", "Downloading " + tag);
@@ -528,7 +542,7 @@ void runInstall(const Plan& plan, const Env& env, Progress& pr) {
         int n = extractZip(c, zp, false);
         remove(zp.c_str());
         if (n < 0) return fail("Atmosphère package couldn't be opened.");
-        pr.addLog("Atmosphère " + tag + " installed");
+        pr.addLog(std::string(usedOwn ? "14CFW Atmosphère " : "Atmosphère ") + tag + " installed");
         step++;
         pr.frac = base();
     }
@@ -603,6 +617,7 @@ Settings loadSettings() {
         else if (k == "splash") s.splash = v != 0;
         else if (k == "autoboot") s.autoboot = v != 0;
         else if (k == "tweaks") s.tweaks = v != 0;
+        else if (k == "official_ams") s.officialAms = v != 0;
         else if (k == "bootwait") s.bootwait = (v == 0 || v == 3 || v == 5 || v == 10) ? v : 3;
     }
     fclose(f);
@@ -610,7 +625,7 @@ Settings loadSettings() {
 }
 bool saveSettings(const Settings& s) {
     std::string t = "backup=" + std::to_string(s.backup) + "\nreplace_menu=" + std::to_string(s.replaceIni) + "\nsplash=" + std::to_string(s.splash) +
-                    "\ntweaks=" + std::to_string(s.tweaks) + "\nautoboot=" + std::to_string(s.autoboot) + "\nbootwait=" + std::to_string(s.bootwait) + "\n";
+                    "\nofficial_ams=" + std::to_string(s.officialAms) + "\ntweaks=" + std::to_string(s.tweaks) + "\nautoboot=" + std::to_string(s.autoboot) + "\nbootwait=" + std::to_string(s.bootwait) + "\n";
     return writeText(sd("switch/14CFW/settings.ini"), t);
 }
 
@@ -635,4 +650,24 @@ bool restoreOldMenu(std::string& msg) {
     }
     msg = "Restored";
     return true;
+}
+
+bool parseOwnAms(const std::string& body, std::string& url, std::string& tag) {
+    try {
+        json j = json::parse(body);
+        for (auto& r : j) {
+            std::string t = r.value("tag_name", "");
+            if (!startsWith(t, "ams-") || r.value("draft", false)) continue;
+            for (auto& a : r["assets"]) {
+                std::string n = lower(a.value("name", ""));
+                if (startsWith(n, "14cfw-atmosphere-") && endsWith(n, ".zip")) {
+                    url = a.value("browser_download_url", "");
+                    tag = t.substr(4);
+                    return !url.empty();
+                }
+            }
+        }
+    } catch (...) {
+    }
+    return false;
 }

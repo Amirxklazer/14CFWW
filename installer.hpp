@@ -5,6 +5,7 @@
 #include <vector>
 
 #define CFW_VERSION "1.2.1"
+#define CFW_REPO "Amirxklazer/14CFWW"  // where 14CFW's own Atmosphère builds are released (tags ams-<version>)
 extern std::string g_root;  // "sdmc:/" on the Switch
 
 struct HbApp {
@@ -33,6 +34,7 @@ struct Plan {
     bool ams = true, hekate = true, bootMenu = true, splash = true;
     bool replaceIni = true;  // false: add as bootloader/ini/14CFW.ini
     bool backup = true;
+    bool officialAms = false;  // true: official Atmosphère instead of 14CFW's own build
     bool tweaks = true;     // write recommended atmosphere/config/system_settings.ini if there is none
     bool autoboot = false;  // Hekate boots the first entry (Atmosphere) by itself
     int bootwait = 3;       // seconds Hekate waits at the menu
@@ -60,9 +62,11 @@ void runInstall(const Plan& p, const Env& e, Progress& pr);
 
 // Saved in switch/14CFW/settings.ini
 struct Settings {
-    bool backup = true, replaceIni = true, splash = true, autoboot = false, tweaks = true;
+    bool backup = true, replaceIni = true, splash = true, autoboot = false, tweaks = true, officialAms = false;
     int bootwait = 3;
 };
 Settings loadSettings();
 bool saveSettings(const Settings& s);
+// pure parser (testable): finds the newest "ams-*" release in a GitHub releases list that has a 14cfw-atmosphere-*.zip
+bool parseOwnAms(const std::string& body, std::string& url, std::string& tag);
 bool restoreOldMenu(std::string& msg);  // puts back the newest backed-up hekate_ipl.ini
