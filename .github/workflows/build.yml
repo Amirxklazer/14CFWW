@@ -1,12 +1,29 @@
 name: Build 14CFW
 
+# One workflow, two jobs:
+#  1) "app"        builds the 14CFW app (14CFW.nro + Developer Edition)
+#  2) "atmosphere" builds Atmosphère with "14CFW" in System Settings and publishes it as a
+#                  release called ams-<version>. It only builds when that release doesn't exist yet,
+#                  so normal pushes skip it. Tick "force" when you run it by hand to rebuild.
+
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild Atmosphère even if its release already exists"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays: picks up new Atmosphère releases
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  app:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     container: devkitpro/devkita64:latest
     steps:
@@ -14,24 +31,86 @@ jobs:
 
       - name: Install libraries
         run: |
-          dkp-pacman -Sy --noconfirm
-          dkp-pacman -S --noconfirm --needed switch-sdl2 switch-sdl2_ttf switch-curl switch-mbedtls switch-zlib switch-freetype switch-pkg-config
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --noconfirm switch-sdl2 switch-sdl2_ttf switch-curl switch-freetype switch-zlib switch-mbedtls
 
-      - name: Build
+      - name: Build 14CFW
         run: |
-          export DEVKITPRO=/opt/devkitpro
-          make clean || true
+          make clean
           make -j2
 
-      - name: Package (switch/14CFW/14CFW.nro)
+      - name: Build 14CFW Developer Edition
         run: |
-          mkdir -p dist/switch/14CFW
-          cp 14CFW.nro dist/switch/14CFW/
-          cd dist && zip -r ../14CFW.zip switch
+          mkdir -p dist
+          cp 14CFW.nro dist/
+          make clean
+          make EDITION=dev -j2
+          cp 14CFW-Dev.nro dist/
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload
+        uses: actions/upload-artifact@v4
         with:
           name: 14CFW
-          path: |
-            14CFW.nro
-            14CFW.zip
+          path: dist/*.nro
+
+  atmosphere:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Find the Atmosphère version
+        id: v
+        run: |
+          TAG=$(gh api repos/Atmosphere-NX/Atmosphere/releases/latest --jq .tag_name)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Atmosphère $TAG"
+          SKIP=0
+          if gh release view "ams-$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${{ github.event.inputs.force }}" != "true" ]; then SKIP=1; echo "Already built, skipping"; fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+      - name: Get the Atmosphère source
+        if: steps.v.outputs.skip != '1'
+        run: git clone --depth 1 --branch "${{ steps.v.outputs.tag }}" --recurse-submodules --shallow-submodules https://github.com/Atmosphere-NX/Atmosphere.git ams
+
+      - name: Put 14CFW in System Settings
+        if: steps.v.outputs.skip != '1'
+        run: |
+          F=ams/stratosphere/ams_mitm/source/set_mitm/setsys_mitm_service.cpp
+          grep -c '|AMS %u.%u.%u|%c' "$F"
+          sed -i 's/|AMS %u\.%u\.%u|%c/|14CFW %u.%u.%u|%c/' "$F"
+          test "$(grep -c '|14CFW %u.%u.%u|%c' "$F")" = "1"
+
+      - name: Build the build environment (official Atmosphère Dockerfile)
+        if: steps.v.outputs.skip != '1'
+        run: docker build -t ams-build ams
+
+      - name: Build Atmosphère
+        if: steps.v.outputs.skip != '1'
+        run: |
+          docker run --rm --user root -v "$PWD/ams:/src" -w /src ams-build bash -c "git config --global --add safe.directory '*' && make -j\$(nproc)"
+          sudo chown -R "$(id -u):$(id -g)" ams
+          find ams/out -name 'atmosphere-*.zip' -print
+
+      - name: Merge with the official release (adds hbl + hbmenu)
+        if: steps.v.outputs.skip != '1'
+        run: |
+          TAG="${{ steps.v.outputs.tag }}"
+          mkdir -p base dl
+          gh release download "$TAG" --repo Atmosphere-NX/Atmosphere --pattern 'atmosphere-*.zip' --dir dl
+          OFFICIAL=$(ls dl/atmosphere-*.zip | grep -vi without | head -n1)
+          unzip -q -o "$OFFICIAL" -d base
+          OURS=$(find ams/out -name 'atmosphere-*.zip' | head -n1)
+          unzip -q -o "$OURS" -d base
+          test -f base/hbmenu.nro && test -f base/atmosphere/package3
+          (cd base && zip -q -r "../14cfw-atmosphere-$TAG.zip" .)
+          ls -la 14cfw-atmosphere-*.zip
+
+      - name: Publish release
+        if: steps.v.outputs.skip != '1'
+        run: |
+          TAG="${{ steps.v.outputs.tag }}"
+          gh release delete "ams-$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "ams-$TAG" "14cfw-atmosphere-$TAG.zip" --repo "$GITHUB_REPOSITORY" \
+            --title "14CFW Atmosphère $TAG" \
+            --notes "Atmosphère $TAG built from source with 14CFW in System Settings. Installed by the 14CFW installer."
