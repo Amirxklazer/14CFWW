@@ -2,9 +2,8 @@ name: Build 14CFW
 
 # One workflow, two jobs:
 #  1) "app"        builds the 14CFW app (14CFW.nro + Developer Edition)
-#  2) "atmosphere" builds Atmosphère with "14CFW" in System Settings and publishes it as a
-#                  release called ams-<version>. It only builds when that release doesn't exist yet,
-#                  so normal pushes skip it. Tick "force" when you run it by hand to rebuild.
+#  2) "atmosphere" (optional, manual only) builds Atmosphère with "14CFW" in System Settings.
+#                  Normal pushes only build the app.
 
 on:
   push:
@@ -15,8 +14,6 @@ on:
         description: "Rebuild Atmosphère even if its release already exists"
         type: boolean
         default: false
-  schedule:
-    - cron: "0 6 * * 1"   # Mondays: picks up new Atmosphère releases
 
 permissions:
   contents: write
@@ -61,7 +58,7 @@ jobs:
           path: dist/*.nro
 
   atmosphere:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch'   # only when you press Run workflow by hand
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
