@@ -8,7 +8,7 @@
 #include <cstring>
 
 bool logoLoad(LogoSize s, Rgba& out) {
-    const EmbImg* e = s == LOGO_S_BIG ? &LOGO_BIG : s == LOGO_S_ICON ? &LOGO_ICON : &LOGO_TAG;
+    const EmbImg* e = s == LOGO_S_BIG ? &LOGO_BIG : &LOGO_ICON;
     out.w = e->w;
     out.h = e->h;
     out.px.assign((size_t)e->rawlen, 0);
